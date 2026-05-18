@@ -1,0 +1,26 @@
+{
+  "name": "willem-dafate",
+  "version": "1.0.0",
+  "description": "Bot de Fate para Discord",
+  "main": "src/bot.ts",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/bot.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "@types/pg": "^8.20.0",
+    "drizzle-kit": "^0.31.10",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}
