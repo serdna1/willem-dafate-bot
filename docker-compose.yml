@@ -12,7 +12,7 @@ services:
       - pgdata:/var/lib/postgresql/data
 
   bot:
-    image: ghcr.io/serdna1/willem-dafate-bot/fate-bot:latest
+    build: .
     restart: always
     depends_on:
       - db
@@ -20,13 +20,6 @@ services:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - DATABASE_URL=${DATABASE_URL_DOCKER}
     command: sh -c "npm run db:push && npm start"
-
-  watchtower:
-    image: containrrr/watchtower
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 300 --cleanup
 
 volumes:
   pgdata:
