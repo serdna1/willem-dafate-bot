@@ -14,8 +14,8 @@ import {
   TextChannel
 } from 'discord.js';
 import { db } from './db/index.js';
-import { characters, adventures, encounters } from './db/schema.js';
-import { eq, and } from 'drizzle-orm';
+import { characters, adventures, encounters, notes } from './db/schema.js';
+import { eq, and, desc, or } from 'drizzle-orm';
 import { getTranslation } from './i18n.js';
 
 const client = new Client({
@@ -23,14 +23,17 @@ const client = new Client({
 });
 
 const EMBED_COLOR = 0xFF1493;
-const SHEET_COLOR = 0xFFA500; // Color distintivo para la ficha de personaje
+const SHEET_COLOR = 0xFFA500;
 const BATTLE_COLOR = 0xDC143C;
+const NOTE_COLOR = 0x00CED1;
 
 interface QueueItem {
   characterId: number;
   ap: number;
-  isCurrent: boolean;
+  maxAp: number;
 }
+
+const activeSheetInteractions = new Map<string, { interaction: any; page: number }>();
 
 async function getGuildLanguage(guildId: string): Promise<string> {
   const activeAdv = await db.query.adventures.findFirst({
@@ -53,25 +56,14 @@ function rollDice(diceCount: number, modifier: number = 0) {
   return { results, total: total + modifier };
 }
 
-/**
- * Parsea expresiones de dados tipo:
- * - "4df"
- * - "4df +2"
- * - "4df investigar"
- * - "4df investigar Antonio"
- * - "2dfss +1"
- * - "4dfs investigar"
- */
 async function parseAndExecuteRoll(
   rawExpression: string,
   guildId: string,
   userId: string,
   allowPrivateS: boolean
 ) {
-  const regex = allowPrivateS
-    ? /^(\d+)df(ss|s)?(?:\s+(.*))?$/i
-    : /^(\d+)df(ss)?(?:\s+(.*))?$/i;
-
+  // Regex corregido para capturar correctamente: 4df, 4dfs(+n/skill), 4dfss, etc.
+  const regex = /^(\d+)df(ss|s)?(?:\s+(.*)|([+-]\d+))?$/i;
   const match = rawExpression.trim().match(regex);
   if (!match) return null;
 
@@ -79,36 +71,33 @@ async function parseAndExecuteRoll(
   if (diceCount < 1 || diceCount > 100) return null;
 
   const mode = (match[2] || '').toLowerCase(); // '' | 's' | 'ss'
-  const rest = (match[3] || '').trim();
+  if (mode === 's' && !allowPrivateS) return null;
 
+  // Si hizo match con el grupo 3 (texto/habilidad/mod) o grupo 4 (modificador directo sin espacio ej: 4dfs+2)
+  const rest = (match[3] || match[4] || '').trim();
   let modifier = 0;
   let labelDetail = '';
 
   if (rest) {
-    // Comprobar si es modificador numérico directo (+2, -1)
     const numMatch = rest.match(/^([+-]?\d+)$/);
     if (numMatch) {
       modifier = parseInt(numMatch[1], 10);
       labelDetail = `Mod: ${modifier >= 0 ? '+' : ''}${modifier}`;
     } else {
-      // Es habilidad y opcionalmente nombre de personaje: "<skill>" o "<skill> <characterName>"
       const parts = rest.split(/\s+/);
       let character = null;
       let skillQuery = '';
 
       if (parts.length >= 2) {
-        // Intentar buscar personaje con la última palabra o combinaciones
         const possibleCharName = parts.slice(1).join(' ');
         character = await db.query.characters.findFirst({
           where: and(eq(characters.name, possibleCharName), eq(characters.guildId, guildId))
         });
-
         if (character) {
           skillQuery = parts[0].toLowerCase();
         }
       }
 
-      // Si no se especificó personaje válido al final, buscar el linkado al usuario
       if (!character) {
         skillQuery = rest.toLowerCase();
         character = await db.query.characters.findFirst({
@@ -148,90 +137,122 @@ async function parseAndExecuteRoll(
   };
 }
 
-/**
- * Construye el payload completo (Embed + Componentes) de la ficha larga del personaje
- */
-function buildFullSheetPayload(character: any, t: any) {
-  const aspectsText = character.aspects && character.aspects.trim() !== '' ? character.aspects : 'None';
-  const stuntsText = character.stunts && character.stunts.trim() !== '' ? character.stunts : 'None';
-  const extrasText = character.extras && character.extras.trim() !== '' ? character.extras : 'None';
-  const consequences = (character.consequences as { mild: string; moderate: string; severe: string }) || { mild: '', moderate: '', severe: '' };
-  const constText = `**${t.mild}:** ${consequences.mild || 'None'}\n**${t.moderate}:** ${consequences.moderate || 'None'}\n**${t.severe}:** ${consequences.severe || 'None'}`;
+function buildSheetPagePayload(character: any, page: number, t: any) {
+  const totalPages = 7;
+  const safePage = ((page % totalPages) + totalPages) % totalPages;
 
-  const phys = (character.physicalStress as boolean[]) || [false, false, false, false];
-  const ment = (character.mentalStress as boolean[]) || [false, false, false, false];
-  const renderBoxes = (arr: boolean[]) => arr.map((v, i) => (v ? `[■ ${i + 1}]` : `[□ ${i + 1}]`)).join(' ');
-
-  const skillsObj = (character.skills as Record<string, string[]>) || {};
-  const skillsTextLines: string[] = [];
-  const sortedMods = Object.keys(skillsObj).sort((a, b) => parseInt(b, 10) - parseInt(a, 10));
-  for (const mod of sortedMods) {
-    if (skillsObj[mod]?.length > 0) {
-      skillsTextLines.push(`**${mod}:** ${skillsObj[mod].join(', ')}`);
-    }
-  }
-  const formattedSkillsText = skillsTextLines.join('\n') || 'None';
+  const pageTitles = [
+    t.description,
+    t.aspects,
+    t.skills,
+    t.stunts,
+    t.extras,
+    t.consequences,
+    t.stress
+  ];
 
   const embed = new EmbedBuilder()
     .setColor(SHEET_COLOR)
     .setTitle(`✦ ${t.character.toUpperCase()}: ${character.name.toUpperCase()} ✦`)
-    .addFields(
-      { name: t.description, value: character.description || 'N/A' },
-      { name: t.refresh, value: `**${character.refresh ?? 3}**`, inline: true },
-      { name: t.physicalStress, value: renderBoxes(phys), inline: true },
-      { name: t.mentalStress, value: renderBoxes(ment), inline: true },
-      { name: t.aspects, value: aspectsText },
-      { name: t.skills, value: formattedSkillsText },
-      { name: t.stunts, value: stuntsText },
-      { name: t.extras, value: extrasText },
-      { name: t.consequences, value: constText }
-    );
+    .setDescription(`**${t.refresh}:** \`${character.refresh ?? 3}\`  |  **${pageTitles[safePage]}**`)
+    .setFooter({ text: `${t.page} ${safePage + 1}/${totalPages}` });
 
-  const editRow1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`edit_id_${character.id}`).setLabel(t.editId).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`edit_aspects_${character.id}`).setLabel(t.editAspects).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`edit_skills_${character.id}`).setLabel(t.editSkills).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`edit_stunts_${character.id}`).setLabel(t.editStunts).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`edit_extras_${character.id}`).setLabel(t.editExtras).setStyle(ButtonStyle.Secondary)
-  );
-
-  const editRow2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`edit_stress_${character.id}`).setLabel(t.editStress).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`edit_consequences_${character.id}`).setLabel(t.editConsequences).setStyle(ButtonStyle.Secondary)
+  const headerRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`sh_edit_name_${character.id}_${safePage}`).setLabel(t.editName).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`sh_edit_refresh_${character.id}_${safePage}`).setLabel(t.editRefresh).setStyle(ButtonStyle.Secondary)
   );
 
   const skillRows: ActionRowBuilder<ButtonBuilder>[] = [];
-  let currentSkillRow = new ActionRowBuilder<ButtonBuilder>();
-  let skillButtonCount = 0;
 
-  for (const mod of sortedMods) {
-    for (const skill of skillsObj[mod]) {
-      if (skillRows.length >= 3) break; // Máximo 5 filas totales en Discord (2 edit + 3 skills)
-      if (skillButtonCount >= 5) {
-        skillRows.push(currentSkillRow);
-        currentSkillRow = new ActionRowBuilder<ButtonBuilder>();
-        skillButtonCount = 0;
+  if (safePage === 0) {
+    embed.addFields({ name: t.description, value: character.description || 'N/A' });
+    headerRow.addComponents(
+      new ButtonBuilder().setCustomId(`sh_edit_desc_${character.id}_${safePage}`).setLabel(t.editDescription).setStyle(ButtonStyle.Secondary)
+    );
+  } else if (safePage === 1) {
+    embed.addFields({ name: t.aspects, value: character.aspects && character.aspects.trim() !== '' ? character.aspects : 'None' });
+    headerRow.addComponents(
+      new ButtonBuilder().setCustomId(`sh_edit_aspects_${character.id}_${safePage}`).setLabel(t.editAspects).setStyle(ButtonStyle.Secondary)
+    );
+  } else if (safePage === 2) {
+    const skillsObj = (character.skills as Record<string, string[]>) || {};
+    const sortedMods = Object.keys(skillsObj).sort((a, b) => parseInt(b, 10) - parseInt(a, 10));
+    const lines: string[] = [];
+    for (const mod of sortedMods) {
+      if (skillsObj[mod]?.length > 0) {
+        lines.push(`**${mod}:** ${skillsObj[mod].join(', ')}`);
       }
-      currentSkillRow.addComponents(
-        new ButtonBuilder()
-          .setCustomId(`skill_roll_${character.id}_${skill}`)
-          .setLabel(`${t.roll} ${skill} (${mod})`)
-          .setStyle(ButtonStyle.Success)
-      );
-      skillButtonCount++;
     }
-  }
-  if (skillButtonCount > 0 && skillRows.length < 3) {
-    skillRows.push(currentSkillRow);
+    embed.addFields({ name: t.skills, value: lines.join('\n') || 'None' });
+    headerRow.addComponents(
+      new ButtonBuilder().setCustomId(`sh_edit_skills_${character.id}_${safePage}`).setLabel(t.editSkills).setStyle(ButtonStyle.Secondary)
+    );
+
+    let currentRow = new ActionRowBuilder<ButtonBuilder>();
+    let count = 0;
+    for (const mod of sortedMods) {
+      for (const skill of skillsObj[mod]) {
+        if (skillRows.length >= 3) break;
+        if (count >= 5) {
+          skillRows.push(currentRow);
+          currentRow = new ActionRowBuilder<ButtonBuilder>();
+          count = 0;
+        }
+        currentRow.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`skill_roll_${character.id}_${skill}`)
+            .setLabel(`${t.roll} ${skill} (${mod})`)
+            .setStyle(ButtonStyle.Success)
+        );
+        count++;
+      }
+    }
+    if (count > 0 && skillRows.length < 3) {
+      skillRows.push(currentRow);
+    }
+  } else if (safePage === 3) {
+    embed.addFields({ name: t.stunts, value: character.stunts && character.stunts.trim() !== '' ? character.stunts : 'None' });
+    headerRow.addComponents(
+      new ButtonBuilder().setCustomId(`sh_edit_stunts_${character.id}_${safePage}`).setLabel(t.editStunts).setStyle(ButtonStyle.Secondary)
+    );
+  } else if (safePage === 4) {
+    embed.addFields({ name: t.extras, value: character.extras && character.extras.trim() !== '' ? character.extras : 'None' });
+    headerRow.addComponents(
+      new ButtonBuilder().setCustomId(`sh_edit_extras_${character.id}_${safePage}`).setLabel(t.editExtras).setStyle(ButtonStyle.Secondary)
+    );
+  } else if (safePage === 5) {
+    const cons = (character.consequences as { mild: string; moderate: string; severe: string }) || { mild: '', moderate: '', severe: '' };
+    embed.addFields(
+      { name: t.mild, value: cons.mild || 'None' },
+      { name: t.moderate, value: cons.moderate || 'None' },
+      { name: t.severe, value: cons.severe || 'None' }
+    );
+    headerRow.addComponents(
+      new ButtonBuilder().setCustomId(`sh_edit_cons_${character.id}_${safePage}`).setLabel(t.editConsequences).setStyle(ButtonStyle.Secondary)
+    );
+  } else if (safePage === 6) {
+    const phys = (character.physicalStress as boolean[]) || [false, false, false, false];
+    const ment = (character.mentalStress as boolean[]) || [false, false, false, false];
+    const renderBoxes = (arr: boolean[]) => arr.map((v, i) => (v ? `[■ ${i + 1}]` : `[□ ${i + 1}]`)).join(' ');
+
+    embed.addFields(
+      { name: t.physicalStress, value: renderBoxes(phys), inline: true },
+      { name: t.mentalStress, value: renderBoxes(ment), inline: true }
+    );
+    headerRow.addComponents(
+      new ButtonBuilder().setCustomId(`sh_edit_stress_${character.id}_${safePage}`).setLabel(t.editStress).setStyle(ButtonStyle.Secondary)
+    );
   }
 
-  return { embeds: [embed], components: [editRow1, editRow2, ...skillRows] };
+  const navRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`sh_page_${character.id}_${safePage - 1}`).setLabel(t.prevPage).setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`sh_page_${character.id}_${safePage + 1}`).setLabel(t.nextPage).setStyle(ButtonStyle.Primary)
+  );
+
+  return { embeds: [embed], components: [headerRow, ...skillRows, navRow] };
 }
 
-/**
- * Construye y actualiza el mensaje Dashboard del Encuentro/Combate
- */
-async function buildBattleDashboard(encounter: any, t: any) {
+async function buildEncounterDashboard(encounter: any, t: any) {
   const queue = (encounter.turnQueue as QueueItem[]) || [];
   const allChars = await db.query.characters.findMany({
     where: eq(characters.guildId, encounter.guildId)
@@ -239,32 +260,34 @@ async function buildBattleDashboard(encounter: any, t: any) {
   const charMap = new Map(allChars.map(c => [c.id, c]));
 
   const renderStress = (arr: boolean[]) => (arr || [false, false, false, false]).map(v => (v ? '■' : '□')).join('');
-  const renderAP = (ap: number) => {
-    const clamped = Math.max(0, Math.min(3, ap));
-    return '🔴'.repeat(clamped) + '⚪'.repeat(3 - clamped);
+  const renderAP = (ap: number, maxAp: number) => {
+    const safeMax = Math.max(1, maxAp || 3);
+    const clamped = Math.max(0, Math.min(safeMax, ap));
+    return '🔴'.repeat(clamped) + '⚪'.repeat(safeMax - clamped);
   };
 
-  let descriptionLines: string[] = [];
+  const descriptionLines: string[] = [];
 
   if (encounter.sceneAspects && encounter.sceneAspects.trim() !== '') {
     descriptionLines.push(`🌍 **${t.sceneAspects}:**\n> ${encounter.sceneAspects.replace(/\n/g, '\n> ')}\n`);
   }
 
   if (queue.length === 0) {
-    descriptionLines.push('_No characters in turn order yet. Use `/battle-add` or the button below._');
+    descriptionLines.push('_No participants yet. Select an existing character or create a new one below._');
   } else {
     queue.forEach((item, index) => {
       const char = charMap.get(item.characterId);
       if (!char) return;
 
-      const pointer = item.isCurrent ? '▶️ ' : '';
-      const header = item.isCurrent
-        ? `${pointer}**${index + 1}. ${char.name.toUpperCase()}** _(${t.currentTurn})_`
+      const isFirst = index === 0;
+      const maxAp = item.maxAp || 3;
+      const header = isFirst
+        ? `▶️ **1. ${char.name.toUpperCase()}** _(${t.currentTurn})_`
         : `**${index + 1}. ${char.name}**`;
 
       const ef = renderStress(char.physicalStress as boolean[]);
       const em = renderStress(char.mentalStress as boolean[]);
-      const stats = `\`${t.ap}: ${renderAP(item.ap)} (${item.ap}/3)\` | \`${t.refresh}: ${char.refresh ?? 3}\` | \`EF:[${ef}]\` | \`EM:[${em}]\``;
+      const stats = `\`${t.ap}: ${renderAP(item.ap, maxAp)} (${item.ap}/${maxAp})\` | \`${t.refresh}: ${char.refresh ?? 3}\` | \`EF:[${ef}]\` | \`EM:[${em}]\``;
 
       descriptionLines.push(`${header}\n${stats}`);
     });
@@ -275,58 +298,76 @@ async function buildBattleDashboard(encounter: any, t: any) {
     .setTitle(`⚔️ ${t.encounter}: ${encounter.name}`)
     .setDescription(descriptionLines.join('\n\n'));
 
-  if (!encounter.isActive) {
-    embed.setFooter({ text: t.encounterEnded });
-    return { embeds: [embed], components: [] };
-  }
+  const components: any[] = [];
 
-  // Fila 1: Controles del personaje activo (Current Turn)
   const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`btl_ap_add_${encounter.id}`).setLabel(`+1 ${t.ap}`).setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`btl_ap_sub_${encounter.id}`).setLabel(`-1 ${t.ap}`).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`btl_pd_sub_${encounter.id}`).setLabel(`-1 ${t.refresh}`).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`btl_pd_add_${encounter.id}`).setLabel(`+1 ${t.refresh}`).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`btl_skip_${encounter.id}`).setLabel(`⏭️ ${t.skipTurn}`).setStyle(ButtonStyle.Success)
+    new ButtonBuilder().setCustomId(`enc_ap_add_${encounter.id}`).setLabel(`+1 ${t.ap}`).setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`enc_ap_sub_${encounter.id}`).setLabel(`-1 ${t.ap}`).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`enc_skip_${encounter.id}`).setLabel(`⏭️ ${t.skipTurn}`).setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`enc_scene_${encounter.id}`).setLabel(`🌍 ${t.editSceneAspects}`).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`enc_rename_${encounter.id}`).setLabel(`✏️ ${t.renameEncounter}`).setStyle(ButtonStyle.Secondary)
   );
+  components.push(row1);
 
-  const components: any[] = [row1];
-
-  // Fila 2: Selector de personaje
   if (queue.length > 0) {
-    const selectMenu = new StringSelectMenuBuilder()
-      .setCustomId(`btl_select_${encounter.id}`)
+    const selectInQueue = new StringSelectMenuBuilder()
+      .setCustomId(`enc_select_${encounter.id}`)
       .setPlaceholder(t.selectCharPlaceholder);
 
     queue.forEach((item, idx) => {
       const char = charMap.get(item.characterId);
       if (char) {
-        selectMenu.addOptions({
+        selectInQueue.addOptions({
           label: `${idx + 1}. ${char.name}`,
           value: String(char.id),
           default: encounter.selectedCharId === char.id
         });
       }
     });
+    components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectInQueue));
 
-    components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu));
-
-    // Fila 3: Manipulación sobre el personaje seleccionado
     const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`btl_up_${encounter.id}`).setLabel(`⬆️ ${t.moveUp}`).setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`btl_down_${encounter.id}`).setLabel(`⬇️ ${t.moveDown}`).setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`btl_turn_${encounter.id}`).setLabel(`⚡ ${t.giveTurn}`).setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`btl_stress_${encounter.id}`).setLabel(`🩸 ${t.stress}`).setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`btl_del_${encounter.id}`).setLabel(`❌ ${t.removeChar}`).setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId(`enc_up_${encounter.id}`).setLabel(`⬆️ ${t.moveUp}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_down_${encounter.id}`).setLabel(`⬇️ ${t.moveDown}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_turn_${encounter.id}`).setLabel(`⚡ ${t.giveTurn}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_stress_${encounter.id}`).setLabel(`🩸 ${t.stress}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_delchar_${encounter.id}`).setLabel(`❌ ${t.removeChar}`).setStyle(ButtonStyle.Danger)
     );
     components.push(row3);
+
+    const row4 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`enc_maxap_add_${encounter.id}`).setLabel(`+1 ${t.maxAp}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_maxap_sub_${encounter.id}`).setLabel(`-1 ${t.maxAp}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_newchar_${encounter.id}`).setLabel(`➕ ${t.addNewCharBtn}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_delete_${encounter.id}`).setLabel(`🗑️ ${t.deleteEncounter}`).setStyle(ButtonStyle.Danger)
+    );
+    components.push(row4);
+  } else {
+    const rowEmpty = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`enc_newchar_${encounter.id}`).setLabel(`➕ ${t.addNewCharBtn}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_delete_${encounter.id}`).setLabel(`🗑️ ${t.deleteEncounter}`).setStyle(ButtonStyle.Danger)
+    );
+    components.push(rowEmpty);
   }
 
-  // Fila 4: Escena y añadir personaje rápido
-  const row4 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`btl_scene_${encounter.id}`).setLabel(`🌍 ${t.editSceneAspects}`).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`btl_addchar_${encounter.id}`).setLabel(`➕ ${t.addNpcBtn}`).setStyle(ButtonStyle.Secondary)
-  );
-  components.push(row4);
+  const existingChars = allChars
+    .filter(c => c.adventureId === encounter.adventureId && !queue.some(q => q.characterId === c.id))
+    .slice(0, 25);
+
+  if (existingChars.length > 0 && components.length < 5) {
+    const addExistingMenu = new StringSelectMenuBuilder()
+      .setCustomId(`enc_addexisting_${encounter.id}`)
+      .setPlaceholder(t.addExistingPlaceholder);
+
+    existingChars.forEach(c => {
+      addExistingMenu.addOptions({
+        label: c.name,
+        value: String(c.id)
+      });
+    });
+
+    components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(addExistingMenu));
+  }
 
   return { embeds: [embed], components };
 }
@@ -340,12 +381,177 @@ async function refreshEncounterMessage(encounterId: number, t: any) {
     if (!channel) return;
     const msg = await channel.messages.fetch(encounter.messageId);
     if (!msg) return;
-
-    const payload = await buildBattleDashboard(encounter, t);
+    const payload = await buildEncounterDashboard(encounter, t);
     await msg.edit(payload);
   } catch (err) {
-    console.error('Could not refresh battle message:', err);
+    console.error('Could not refresh encounter message:', err);
   }
+}
+
+async function buildEncountersListPayload(guildId: string, page: number, t: any) {
+  const allEncounters = await db.query.encounters.findMany({
+    where: eq(encounters.guildId, guildId),
+    orderBy: [desc(encounters.createdAt), desc(encounters.id)]
+  });
+
+  const pageSize = 5;
+  const totalPages = Math.max(1, Math.ceil(allEncounters.length / pageSize));
+  const safePage = Math.max(0, Math.min(totalPages - 1, page));
+  const slice = allEncounters.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  const embed = new EmbedBuilder()
+    .setColor(BATTLE_COLOR)
+    .setTitle(`⚔️ ${t.encountersList}`)
+    .setDescription(
+      slice.length > 0
+        ? slice.map((e, i) => `**${safePage * pageSize + i + 1}.** ${e.name}`).join('\n')
+        : '_No encounters created yet._'
+    )
+    .setFooter({ text: `${t.page} ${safePage + 1}/${totalPages}` });
+
+  const components: ActionRowBuilder<ButtonBuilder>[] = [];
+
+  if (slice.length > 0) {
+    const openRow = new ActionRowBuilder<ButtonBuilder>();
+    slice.forEach(enc => {
+      openRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`enclist_open_${enc.id}`)
+          .setLabel(enc.name.slice(0, 20))
+          .setStyle(ButtonStyle.Secondary)
+      );
+    });
+    components.push(openRow);
+  }
+
+  const navRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`enclist_page_${safePage - 1}`)
+      .setLabel(t.prevPage)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(safePage === 0),
+    new ButtonBuilder()
+      .setCustomId(`enclist_page_${safePage + 1}`)
+      .setLabel(t.nextPage)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(safePage >= totalPages - 1)
+  );
+  components.push(navRow);
+
+  return { embeds: [embed], components };
+}
+
+async function buildNotesListPayload(guildId: string, userId: string, visibilityFilter: string, page: number, t: any) {
+  const allNotes = await db.query.notes.findMany({
+    where: eq(notes.guildId, guildId),
+    orderBy: [desc(notes.isPinned), desc(notes.createdAt), desc(notes.id)]
+  });
+
+  // Si no se filtra específicamente por 'private', mostramos públicas + las privadas del usuario actual
+  const filtered = allNotes.filter(n => {
+    if (visibilityFilter === 'private') {
+      return !n.isPublic && n.authorId === userId;
+    }
+    // Si es 'public' (por defecto), muestra las públicas y las privadas propias del usuario
+    return n.isPublic === true || n.authorId === userId;
+  });
+
+  const pageSize = 5;
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.max(0, Math.min(totalPages - 1, page));
+  const slice = filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  const embed = new EmbedBuilder()
+    .setColor(NOTE_COLOR)
+    .setTitle(`📝 ${t.notesTitle} (${visibilityFilter === 'private' ? t.privateLabel : 'Public & Mine'})`)
+    .setFooter({ text: `${t.page} ${safePage + 1}/${totalPages}` });
+
+  if (slice.length === 0) {
+    embed.setDescription(`_${t.noNotes}_`);
+  } else {
+    for (const n of slice) {
+      const pinIcon = n.isPinned ? '📌 ' : '';
+      let contentPreview = n.content && n.content.trim() !== '' ? n.content : '_Empty_';
+      
+      // Limitar a aproximadamente 3 líneas o 200 caracteres para la vista previa
+      const lines = contentPreview.split('\n');
+      if (lines.length > 3) {
+        contentPreview = lines.slice(0, 3).join('\n') + '\n...';
+      }
+      if (contentPreview.length > 250) {
+        contentPreview = contentPreview.slice(0, 250) + '...';
+      }
+
+      // Obtener nombre del autor
+      let authorName = 'Unknown';
+      try {
+        const userObj = await client.users.fetch(n.authorId);
+        authorName = userObj ? userObj.username : 'Unknown';
+      } catch (e) {}
+
+      const visText = n.isPublic ? t.publicLabel : t.privateLabel;
+      const fieldVal = `${contentPreview}\n*${t.author}: ${authorName} | ${t.visibility}: ${visText}*`;
+
+      embed.addFields({ name: `${pinIcon}${n.title}`, value: fieldVal.slice(0, 1024) });
+    }
+  }
+
+  const components: ActionRowBuilder<ButtonBuilder>[] = [];
+
+  if (slice.length > 0) {
+    const editRow = new ActionRowBuilder<ButtonBuilder>();
+    const pinRow = new ActionRowBuilder<ButtonBuilder>();
+    const visRow = new ActionRowBuilder<ButtonBuilder>();
+
+    slice.forEach(n => {
+      const shortTitle = n.title.slice(0, 14);
+      editRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`note_edit_${n.id}_${visibilityFilter}_${safePage}`)
+          .setLabel(`✏️ ${shortTitle}`)
+          .setStyle(ButtonStyle.Secondary)
+      );
+      pinRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`note_pin_${n.id}_${visibilityFilter}_${safePage}`)
+          .setLabel(`📌 ${shortTitle}`)
+          .setStyle(ButtonStyle.Secondary)
+      );
+      visRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`note_vis_${n.id}_${visibilityFilter}_${safePage}`)
+          .setLabel(`👁️ ${shortTitle}`)
+          .setStyle(ButtonStyle.Secondary)
+      );
+    });
+
+    components.push(editRow, pinRow, visRow);
+  }
+
+  // Fila extra con botón para crear nota nueva desde la interfaz de /notas
+  const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`note_createbtn_${visibilityFilter}_${safePage}`)
+      .setLabel(`➕ ${t.createNoteBtn}`)
+      .setStyle(ButtonStyle.Success)
+  );
+  components.push(actionRow);
+
+  const navRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`note_page_${visibilityFilter}_${safePage - 1}`)
+      .setLabel(t.prevPage)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(safePage === 0),
+    new ButtonBuilder()
+      .setCustomId(`note_page_${visibilityFilter}_${safePage + 1}`)
+      .setLabel(t.nextPage)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(safePage >= totalPages - 1)
+  );
+  components.push(navRow);
+
+  return { embeds: [embed], components };
 }
 
 client.on('ready', async () => {
@@ -359,7 +565,7 @@ client.on('ready', async () => {
         {
           name: 'expression',
           type: ApplicationCommandOptionType.String,
-          description: 'e.g. 4df, 4dfs, 4dfss, 4df +2, 4df Shoot, 4df Shoot Antonio',
+          description: 'e.g. 4df, 4dfs +2, 4dfs empathy Antonio',
           required: true
         }
       ]
@@ -371,7 +577,7 @@ client.on('ready', async () => {
         {
           name: 'name',
           type: ApplicationCommandOptionType.String,
-          description: 'Character name (optional, defaults to your linked character)',
+          description: 'Character name',
           required: false
         }
       ]
@@ -393,7 +599,7 @@ client.on('ready', async () => {
       ]
     },
     {
-      name: 'create-adventure',
+      name: 'adventure-create',
       description: 'Create a new Fate adventure',
       options: [
         { name: 'name', type: ApplicationCommandOptionType.String, description: 'Adventure name', required: true },
@@ -401,12 +607,12 @@ client.on('ready', async () => {
       ]
     },
     {
-      name: 'start-adventure',
+      name: 'adventure-start',
       description: 'Set an adventure as active',
       options: [{ name: 'name', type: ApplicationCommandOptionType.String, description: 'Adventure name', required: true }]
     },
     {
-      name: 'end-adventure',
+      name: 'adventure-end',
       description: 'Clear the active adventure'
     },
     {
@@ -414,33 +620,59 @@ client.on('ready', async () => {
       description: 'Show active adventure details and edit options'
     },
     {
-      name: 'create-character',
+      name: 'character-create',
       description: 'Create a new character in the active adventure',
       options: [{ name: 'name', type: ApplicationCommandOptionType.String, description: 'Character name', required: true }]
     },
     {
-      name: 'link-char',
+      name: 'character-link',
       description: 'Link yourself to a character and get its role',
       options: [{ name: 'name', type: ApplicationCommandOptionType.String, description: 'Character name', required: true }]
     },
     {
-      name: 'battle-start',
-      description: 'Start a turn-based encounter dashboard',
+      name: 'encounter-create',
+      description: 'Create a new encounter',
       options: [
         { name: 'name', type: ApplicationCommandOptionType.String, description: 'Encounter name', required: true },
         { name: 'scene_aspects', type: ApplicationCommandOptionType.String, description: 'Initial scene aspects', required: false }
       ]
     },
     {
-      name: 'battle-add',
-      description: 'Add a character to the active encounter (creates it if it does not exist)',
+      name: 'encounters',
+      description: 'List all encounters with pagination'
+    },
+    {
+      name: 'note-create',
+      description: 'Create a new note',
       options: [
-        { name: 'name', type: ApplicationCommandOptionType.String, description: 'Character name', required: true }
+        { name: 'title', type: ApplicationCommandOptionType.String, description: 'Note title', required: true },
+        {
+          name: 'visibility',
+          type: ApplicationCommandOptionType.String,
+          description: 'Visibility (default: private)',
+          required: false,
+          choices: [
+            { name: 'Private', value: 'private' },
+            { name: 'Public', value: 'public' }
+          ]
+        }
       ]
     },
     {
-      name: 'battle-end',
-      description: 'End the active encounter'
+      name: 'notes',
+      description: 'View notes list',
+      options: [
+        {
+          name: 'visibility',
+          type: ApplicationCommandOptionType.String,
+          description: 'Filter notes',
+          required: false,
+          choices: [
+            { name: 'Public', value: 'public' },
+            { name: 'Private', value: 'private' }
+          ]
+        }
+      ]
     },
     {
       name: 'View Character Sheet',
@@ -449,7 +681,6 @@ client.on('ready', async () => {
   ]);
 });
 
-// Mensajes de texto normales: solo soporta Ndf y Ndfss (4dfs privado requiere /roll)
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guildId) return;
   const text = message.content.trim();
@@ -459,7 +690,6 @@ client.on('messageCreate', async (message) => {
   const lang = await getGuildLanguage(message.guildId);
   const t = getTranslation(lang);
 
-  // allowPrivateS = false -> 4dfs en texto plano no se ejecuta; 4dfss y 4df sí
   const rollOutcome = await parseAndExecuteRoll(text, message.guildId, message.author.id, false);
   if (!rollOutcome) return;
 
@@ -471,7 +701,6 @@ client.on('messageCreate', async (message) => {
 
   const detailText = rollOutcome.labelDetail ? ` (${rollOutcome.labelDetail})` : '';
 
-  // Modo 4dfss: oculto para todos hasta que alguien pulse el botón
   if (rollOutcome.mode === 'ss') {
     const payloadData = Buffer.from(
       JSON.stringify({
@@ -496,7 +725,6 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // Modo normal Ndf
   const embed = new EmbedBuilder()
     .setColor(EMBED_COLOR)
     .setTitle(t.diceRollResult)
@@ -510,9 +738,6 @@ client.on('interactionCreate', async (interaction) => {
   const lang = await getGuildLanguage(interaction.guildId);
   const t = getTranslation(lang);
 
-  // ==========================================
-  // 1. SLASH COMMANDS
-  // ==========================================
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
 
@@ -533,7 +758,6 @@ client.on('interactionCreate', async (interaction) => {
 
       const detailText = rollOutcome.labelDetail ? ` (${rollOutcome.labelDetail})` : '';
 
-      // /roll 4dfs -> Efímero solo para el usuario que tira, con botón para hacer público
       if (rollOutcome.mode === 's') {
         const payloadData = Buffer.from(
           JSON.stringify({
@@ -559,7 +783,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // /roll 4dfss -> Oculto para todos con botón público
       if (rollOutcome.mode === 'ss') {
         const payloadData = Buffer.from(
           JSON.stringify({
@@ -584,7 +807,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // /roll 4df -> Público normal
       const embed = new EmbedBuilder()
         .setColor(EMBED_COLOR)
         .setTitle(t.diceRollResult)
@@ -608,8 +830,9 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      const payload = buildFullSheetPayload(character, t);
+      const payload = buildSheetPagePayload(character, 0, t);
       await interaction.reply({ ...payload, ephemeral: true });
+      activeSheetInteractions.set(`${interaction.user.id}_${character.id}`, { interaction, page: 0 });
     }
 
     if (commandName === 'change_language') {
@@ -622,7 +845,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ content: newT.langChanged, ephemeral: true });
     }
 
-    if (commandName === 'create-adventure') {
+    if (commandName === 'adventure-create') {
       const name = interaction.options.getString('name', true);
       const description = interaction.options.getString('description');
       await db.insert(adventures).values({ guildId: interaction.guildId, name, description, language: 'english' });
@@ -630,7 +853,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [embed] });
     }
 
-    if (commandName === 'start-adventure') {
+    if (commandName === 'adventure-start') {
       const name = interaction.options.getString('name', true);
       const adventure = await db.query.adventures.findFirst({
         where: and(eq(adventures.name, name), eq(adventures.guildId, interaction.guildId))
@@ -645,7 +868,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [embed] });
     }
 
-    if (commandName === 'end-adventure') {
+    if (commandName === 'adventure-end') {
       await db.update(adventures).set({ isActive: false }).where(eq(adventures.guildId, interaction.guildId));
       const embed = new EmbedBuilder().setColor(EMBED_COLOR).setDescription(`Active adventure cleared.`);
       await interaction.reply({ embeds: [embed] });
@@ -682,7 +905,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [embed], components: [row] });
     }
 
-    if (commandName === 'create-character') {
+    if (commandName === 'character-create') {
       const name = interaction.options.getString('name', true);
       const activeAdventure = await db.query.adventures.findFirst({
         where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
@@ -696,7 +919,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [embed] });
     }
 
-    if (commandName === 'link-char') {
+    if (commandName === 'character-link') {
       const name = interaction.options.getString('name', true);
       const character = await db.query.characters.findFirst({
         where: and(eq(characters.name, name), eq(characters.guildId, interaction.guildId))
@@ -717,115 +940,62 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ embeds: [embed] });
     }
 
-    if (commandName === 'battle-start') {
+    if (commandName === 'encounter-create') {
       const name = interaction.options.getString('name', true);
       const sceneAspects = interaction.options.getString('scene_aspects') || '';
-
       const activeAdventure = await db.query.adventures.findFirst({
         where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
       });
-      if (!activeAdventure) {
-        await interaction.reply({ content: t.noActiveAdventure, ephemeral: true });
-        return;
-      }
-
-      // Desactivar combates anteriores en este servidor
-      await db.update(encounters).set({ isActive: false }).where(eq(encounters.guildId, interaction.guildId));
 
       const [newEncounter] = await db
         .insert(encounters)
         .values({
           guildId: interaction.guildId,
-          adventureId: activeAdventure.id,
+          adventureId: activeAdventure?.id || null,
           name,
           sceneAspects,
           channelId: interaction.channelId,
-          isActive: true,
           turnQueue: []
         })
         .returning();
 
-      const payload = await buildBattleDashboard(newEncounter, t);
+      const payload = await buildEncounterDashboard(newEncounter, t);
       const replyMsg = await interaction.reply({ ...payload, fetchReply: true });
-
       await db.update(encounters).set({ messageId: replyMsg.id }).where(eq(encounters.id, newEncounter.id));
     }
 
-    if (commandName === 'battle-add') {
-      const charName = interaction.options.getString('name', true);
+    if (commandName === 'encounters') {
+      const payload = await buildEncountersListPayload(interaction.guildId, 0, t);
+      await interaction.reply({ ...payload, ephemeral: true });
+    }
+
+    if (commandName === 'note-create') {
+      const title = interaction.options.getString('title', true);
+      const visibility = interaction.options.getString('visibility') || 'private';
+      const isPublic = visibility === 'public';
 
       const activeAdventure = await db.query.adventures.findFirst({
         where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
       });
-      if (!activeAdventure) {
-        await interaction.reply({ content: t.noActiveAdventure, ephemeral: true });
-        return;
-      }
 
-      const activeEncounter = await db.query.encounters.findFirst({
-        where: and(eq(encounters.isActive, true), eq(encounters.guildId, interaction.guildId))
-      });
-      if (!activeEncounter) {
-        await interaction.reply({ content: t.noActiveEncounter, ephemeral: true });
-        return;
-      }
-
-      // Buscar o crear personaje automáticamente
-      let character = await db.query.characters.findFirst({
-        where: and(eq(characters.name, charName), eq(characters.guildId, interaction.guildId))
+      await db.insert(notes).values({
+        guildId: interaction.guildId,
+        adventureId: activeAdventure?.id || null,
+        authorId: interaction.user.id,
+        title,
+        isPublic
       });
 
-      if (!character) {
-        const [created] = await db
-          .insert(characters)
-          .values({
-            guildId: interaction.guildId,
-            adventureId: activeAdventure.id,
-            name: charName
-          })
-          .returning();
-        character = created;
-      }
-
-      const queue = (activeEncounter.turnQueue as QueueItem[]) || [];
-      if (!queue.some(q => q.characterId === character!.id)) {
-        queue.push({
-          characterId: character.id,
-          ap: 0,
-          isCurrent: queue.length === 0
-        });
-      }
-
-      await db
-        .update(encounters)
-        .set({
-          turnQueue: queue as any,
-          selectedCharId: activeEncounter.selectedCharId || character.id
-        })
-        .where(eq(encounters.id, activeEncounter.id));
-
-      await refreshEncounterMessage(activeEncounter.id, t);
-      await interaction.reply({ content: `✅ **${character.name}** added to encounter.`, ephemeral: true });
+      await interaction.reply({ content: `✅ **${title}** (${isPublic ? t.publicLabel : t.privateLabel}) - ${t.noteCreated}`, ephemeral: true });
     }
 
-    if (commandName === 'battle-end') {
-      const activeEncounter = await db.query.encounters.findFirst({
-        where: and(eq(encounters.isActive, true), eq(encounters.guildId, interaction.guildId))
-      });
-      if (!activeEncounter) {
-        await interaction.reply({ content: t.noActiveEncounter, ephemeral: true });
-        return;
-      }
-
-      await db.update(encounters).set({ isActive: false }).where(eq(encounters.id, activeEncounter.id));
-      await refreshEncounterMessage(activeEncounter.id, t);
-      await interaction.reply({ content: t.encounterEnded, ephemeral: true });
+    if (commandName === 'notes') {
+      const visibility = interaction.options.getString('visibility') || 'public';
+      const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, visibility, 0, t);
+      await interaction.reply({ ...payload, ephemeral: visibility === 'private' });
     }
   }
 
-  // ==========================================
-  // 2. USER CONTEXT MENU
-  // ==========================================
   if (interaction.isUserContextMenuCommand() && interaction.commandName === 'View Character Sheet') {
     const character = await db.query.characters.findFirst({
       where: and(eq(characters.discordUserId, interaction.targetId), eq(characters.guildId, interaction.guildId))
@@ -834,32 +1004,52 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ content: t.charNotFound, ephemeral: true });
       return;
     }
-    const payload = buildFullSheetPayload(character, t);
+    const payload = buildSheetPagePayload(character, 0, t);
     await interaction.reply({ ...payload, ephemeral: true });
+    activeSheetInteractions.set(`${interaction.user.id}_${character.id}`, { interaction, page: 0 });
   }
 
-  // ==========================================
-  // 3. SELECT MENUS (COMBATE)
-  // ==========================================
-  if (interaction.isStringSelectMenu() && interaction.customId.startsWith('btl_select_')) {
-    const encounterId = parseInt(interaction.customId.split('_')[2], 10);
-    const selectedCharId = parseInt(interaction.values[0], 10);
+  if (interaction.isStringSelectMenu()) {
+    if (interaction.customId.startsWith('enc_select_')) {
+      const encounterId = parseInt(interaction.customId.split('_')[2], 10);
+      const selectedCharId = parseInt(interaction.values[0], 10);
 
-    await db.update(encounters).set({ selectedCharId }).where(eq(encounters.id, encounterId));
-    const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
-    if (encounter) {
-      const payload = await buildBattleDashboard(encounter, t);
-      await interaction.update(payload);
+      await db.update(encounters).set({ selectedCharId }).where(eq(encounters.id, encounterId));
+      const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
+      if (encounter) {
+        const payload = await buildEncounterDashboard(encounter, t);
+        await interaction.update(payload);
+      }
+    }
+
+    if (interaction.customId.startsWith('enc_addexisting_')) {
+      const encounterId = parseInt(interaction.customId.split('_')[2], 10);
+      const charIdToAdd = parseInt(interaction.values[0], 10);
+
+      const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
+      if (encounter) {
+        const queue = (encounter.turnQueue as QueueItem[]) || [];
+        if (!queue.some(q => q.characterId === charIdToAdd)) {
+          queue.push({ characterId: charIdToAdd, ap: 0, maxAp: 3 });
+        }
+        await db
+          .update(encounters)
+          .set({
+            turnQueue: queue as any,
+            selectedCharId: encounter.selectedCharId || charIdToAdd
+          })
+          .where(eq(encounters.id, encounterId));
+
+        const updated = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
+        const payload = await buildEncounterDashboard(updated, t);
+        await interaction.update(payload);
+      }
     }
   }
 
-  // ==========================================
-  // 4. BUTTONS
-  // ==========================================
   if (interaction.isButton()) {
     const id = interaction.customId;
 
-    // 4.1 Revelar tirada silenciosa 4dfss (edita el mensaje original)
     if (id.startsWith('reveal_ss_')) {
       const data = JSON.parse(Buffer.from(id.replace('reveal_ss_', ''), 'base64').toString('utf8'));
       await interaction.update({
@@ -869,7 +1059,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // 4.2 Revelar tirada privada /roll 4dfs (envía mensaje público y deshabilita botón efímero)
     if (id.startsWith('reveal_private_')) {
       const data = JSON.parse(Buffer.from(id.replace('reveal_private_', ''), 'base64').toString('utf8'));
       await interaction.update({
@@ -883,7 +1072,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // 4.3 Tirada de habilidad desde la ficha
     if (id.startsWith('skill_roll_')) {
       const [, , charIdStr, skillName] = id.split('_');
       const charId = parseInt(charIdStr, 10);
@@ -907,11 +1095,131 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // 4.4 Botón Editar Aventura (/adventure-info)
+    if (id.startsWith('sh_page_')) {
+      const [, , charIdStr, pageStr] = id.split('_');
+      const charId = parseInt(charIdStr, 10);
+      const page = parseInt(pageStr, 10);
+      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
+      if (!character) return;
+
+      const payload = buildSheetPagePayload(character, page, t);
+      await interaction.update(payload);
+      activeSheetInteractions.set(`${interaction.user.id}_${charId}`, { interaction, page });
+      return;
+    }
+
+    if (id.startsWith('sh_edit_')) {
+      const parts = id.split('_');
+      const fieldType = parts[2];
+      const charId = parseInt(parts[3], 10);
+      const page = parseInt(parts[4], 10);
+
+      activeSheetInteractions.set(`${interaction.user.id}_${charId}`, { interaction, page });
+      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
+      if (!character) return;
+
+      if (fieldType === 'name') {
+        const modal = new ModalBuilder().setCustomId(`modal_sh_name_${charId}_${page}`).setTitle(t.editName);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('value').setLabel(t.editName).setStyle(TextInputStyle.Short).setValue(character.name || '').setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+      } else if (fieldType === 'refresh') {
+        const modal = new ModalBuilder().setCustomId(`modal_sh_refresh_${charId}_${page}`).setTitle(t.editRefresh);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('value').setLabel(t.refresh).setStyle(TextInputStyle.Short).setValue(String(character.refresh ?? 3)).setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+      } else if (fieldType === 'desc') {
+        const modal = new ModalBuilder().setCustomId(`modal_sh_desc_${charId}_${page}`).setTitle(t.editDescription);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('value').setLabel(t.description).setStyle(TextInputStyle.Paragraph).setValue(character.description || '').setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+      } else if (fieldType === 'aspects') {
+        const modal = new ModalBuilder().setCustomId(`modal_sh_aspects_${charId}_${page}`).setTitle(t.editAspects);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('value').setLabel(t.aspects).setStyle(TextInputStyle.Paragraph).setValue(character.aspects || '').setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+      } else if (fieldType === 'skills') {
+        const skillsObj = (character.skills as Record<string, string[]>) || {};
+        const lines = Object.entries(skillsObj).map(([mod, list]) => `${mod}: ${list.join(', ')}`);
+        const modal = new ModalBuilder().setCustomId(`modal_sh_skills_${charId}_${page}`).setTitle(t.editSkills);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId('value')
+              .setLabel('Format: +4: Skill1, Skill2')
+              .setPlaceholder('+4: Shoot, Athletics\n+3: Empathy')
+              .setStyle(TextInputStyle.Paragraph)
+              .setValue(lines.join('\n'))
+              .setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+      } else if (fieldType === 'stunts') {
+        const modal = new ModalBuilder().setCustomId(`modal_sh_stunts_${charId}_${page}`).setTitle(t.editStunts);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('value').setLabel(t.stunts).setStyle(TextInputStyle.Paragraph).setValue(character.stunts || '').setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+      } else if (fieldType === 'extras') {
+        const modal = new ModalBuilder().setCustomId(`modal_sh_extras_${charId}_${page}`).setTitle(t.editExtras);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('value').setLabel(t.extras).setStyle(TextInputStyle.Paragraph).setValue(character.extras || '').setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+      } else if (fieldType === 'cons') {
+        const cons = (character.consequences as { mild: string; moderate: string; severe: string }) || { mild: '', moderate: '', severe: '' };
+        const modal = new ModalBuilder().setCustomId(`modal_sh_cons_${charId}_${page}`).setTitle(t.editConsequences);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('mild').setLabel(t.mild).setStyle(TextInputStyle.Short).setValue(cons.mild || '').setRequired(false)
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('moderate').setLabel(t.moderate).setStyle(TextInputStyle.Short).setValue(cons.moderate || '').setRequired(false)
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('severe').setLabel(t.severe).setStyle(TextInputStyle.Short).setValue(cons.severe || '').setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+      } else if (fieldType === 'stress') {
+        const phys = (character.physicalStress as boolean[]) || [false, false, false, false];
+        const ment = (character.mentalStress as boolean[]) || [false, false, false, false];
+        const physStr = phys.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
+        const mentStr = ment.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
+
+        const modal = new ModalBuilder().setCustomId(`modal_sh_stress_${charId}_${page}`).setTitle(t.editStress);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('physical').setLabel(`${t.physicalStress} (1-4)`).setStyle(TextInputStyle.Short).setValue(physStr).setRequired(false)
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('mental').setLabel(`${t.mentalStress} (1-4)`).setStyle(TextInputStyle.Short).setValue(mentStr).setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+      }
+      return;
+    }
+
     if (id.startsWith('edit_adv_')) {
       const advId = parseInt(id.split('_')[2], 10);
       const adv = await db.query.adventures.findFirst({ where: eq(adventures.id, advId) });
-
       const modal = new ModalBuilder().setCustomId(`modal_adv_${advId}`).setTitle(t.editAdventure);
       modal.addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
@@ -921,235 +1229,118 @@ client.on('interactionCreate', async (interaction) => {
           new TextInputBuilder().setCustomId('description').setLabel(t.description).setStyle(TextInputStyle.Paragraph).setValue(adv?.description || '').setRequired(false)
         ),
         new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId('is_active')
-            .setLabel('Active? (true / false)')
-            .setStyle(TextInputStyle.Short)
-            .setValue(String(adv?.isActive ?? true))
-            .setRequired(false)
+          new TextInputBuilder().setCustomId('is_active').setLabel('Active? (true / false)').setStyle(TextInputStyle.Short).setValue(String(adv?.isActive ?? true)).setRequired(false)
         )
       );
       await interaction.showModal(modal);
       return;
     }
 
-    // 4.5 Botones de edición de Ficha de Personaje
-    if (id.startsWith('edit_id_')) {
-      const charId = parseInt(id.split('_')[2], 10);
-      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
-
-      const modal = new ModalBuilder().setCustomId(`modal_id_${charId}`).setTitle(t.editId);
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('name').setLabel('Name').setStyle(TextInputStyle.Short).setValue(character?.name || '').setRequired(false)
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('description').setLabel(t.description).setStyle(TextInputStyle.Paragraph).setValue(character?.description || '').setRequired(false)
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('refresh').setLabel(t.refresh).setStyle(TextInputStyle.Short).setValue(String(character?.refresh ?? 3)).setRequired(false)
-        )
-      );
-      await interaction.showModal(modal);
+    if (id.startsWith('enclist_page_')) {
+      const page = parseInt(id.split('_')[2], 10);
+      const payload = await buildEncountersListPayload(interaction.guildId, page, t);
+      await interaction.update(payload);
       return;
     }
 
-    if (id.startsWith('edit_aspects_')) {
-      const charId = parseInt(id.split('_')[2], 10);
-      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
+    if (id.startsWith('enclist_open_')) {
+      const encounterId = parseInt(id.split('_')[2], 10);
+      const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
+      if (!encounter) return;
 
-      const modal = new ModalBuilder().setCustomId(`modal_aspects_${charId}`).setTitle(t.editAspects);
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId('aspects')
-            .setLabel(t.aspects)
-            .setStyle(TextInputStyle.Paragraph)
-            .setValue(character?.aspects || '')
-            .setRequired(false)
-        )
-      );
-      await interaction.showModal(modal);
+      const payload = await buildEncounterDashboard(encounter, t);
+      const msg = await interaction.reply({ ...payload, fetchReply: true });
+      await db.update(encounters).set({ channelId: interaction.channelId, messageId: msg.id }).where(eq(encounters.id, encounterId));
       return;
     }
 
-    if (id.startsWith('edit_skills_')) {
-      const charId = parseInt(id.split('_')[2], 10);
-      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
-      const skillsObj = (character?.skills as Record<string, string[]>) || {};
-
-      const lines: string[] = [];
-      for (const [mod, list] of Object.entries(skillsObj)) {
-        lines.push(`${mod}: ${list.join(', ')}`);
-      }
-
-      const modal = new ModalBuilder().setCustomId(`modal_skills_${charId}`).setTitle(t.editSkills);
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId('skills_text')
-            .setLabel('Format: +4: SkillA, SkillB')
-            .setPlaceholder('+4: Skill1, Skill2\n+3: Skill3')
-            .setStyle(TextInputStyle.Paragraph)
-            .setValue(lines.join('\n'))
-            .setRequired(false)
-        )
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id.startsWith('edit_stunts_')) {
-      const charId = parseInt(id.split('_')[2], 10);
-      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
-
-      const modal = new ModalBuilder().setCustomId(`modal_stunts_${charId}`).setTitle(t.editStunts);
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId('stunts')
-            .setLabel(t.stunts)
-            .setStyle(TextInputStyle.Paragraph)
-            .setValue(character?.stunts || '')
-            .setRequired(false)
-        )
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id.startsWith('edit_extras_')) {
-      const charId = parseInt(id.split('_')[2], 10);
-      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
-
-      const modal = new ModalBuilder().setCustomId(`modal_extras_${charId}`).setTitle(t.editExtras);
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId('extras')
-            .setLabel(t.extras)
-            .setStyle(TextInputStyle.Paragraph)
-            .setValue(character?.extras || '')
-            .setRequired(false)
-        )
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id.startsWith('edit_stress_')) {
-      const charId = parseInt(id.split('_')[2], 10);
-      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
-      const phys = (character?.physicalStress as boolean[]) || [false, false, false, false];
-      const ment = (character?.mentalStress as boolean[]) || [false, false, false, false];
-
-      const physStr = phys.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
-      const mentStr = ment.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
-
-      const modal = new ModalBuilder().setCustomId(`modal_stress_${charId}`).setTitle(t.editStress);
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId('physical')
-            .setLabel(`${t.physicalStress} (1-4)`)
-            .setPlaceholder('1, 2, 3, 4')
-            .setStyle(TextInputStyle.Short)
-            .setValue(physStr)
-            .setRequired(false)
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder()
-            .setCustomId('mental')
-            .setLabel(`${t.mentalStress} (1-4)`)
-            .setPlaceholder('1, 2, 3, 4')
-            .setStyle(TextInputStyle.Short)
-            .setValue(mentStr)
-            .setRequired(false)
-        )
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    if (id.startsWith('edit_consequences_')) {
-      const charId = parseInt(id.split('_')[2], 10);
-      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
-      const cons = (character?.consequences as { mild: string; moderate: string; severe: string }) || { mild: '', moderate: '', severe: '' };
-
-      const modal = new ModalBuilder().setCustomId(`modal_consequences_${charId}`).setTitle(t.editConsequences);
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('mild').setLabel(t.mild).setStyle(TextInputStyle.Short).setValue(cons.mild || '').setRequired(false)
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('moderate').setLabel(t.moderate).setStyle(TextInputStyle.Short).setValue(cons.moderate || '').setRequired(false)
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('severe').setLabel(t.severe).setStyle(TextInputStyle.Short).setValue(cons.severe || '').setRequired(false)
-        )
-      );
-      await interaction.showModal(modal);
-      return;
-    }
-
-    // 4.6 Botones del Sistema de Turnos / Combate
-    if (id.startsWith('btl_')) {
+    if (id.startsWith('enc_')) {
       const parts = id.split('_');
       const encounterId = parseInt(parts[parts.length - 1], 10);
       const action = parts.slice(1, parts.length - 1).join('_');
 
       const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
-      if (!encounter || !encounter.isActive) return;
+      if (!encounter) return;
 
       const queue = (encounter.turnQueue as QueueItem[]) || [];
-      const currentIdx = queue.findIndex(q => q.isCurrent);
       const selectedIdx = queue.findIndex(q => q.characterId === encounter.selectedCharId);
 
-      if (action === 'ap_add' && currentIdx !== -1) {
-        queue[currentIdx].ap = Math.min(3, queue[currentIdx].ap + 1);
-      } else if (action === 'ap_sub' && currentIdx !== -1) {
-        queue[currentIdx].ap = Math.max(0, queue[currentIdx].ap - 1);
-      } else if (action === 'pd_sub' && currentIdx !== -1) {
-        const char = await db.query.characters.findFirst({ where: eq(characters.id, queue[currentIdx].characterId) });
-        if (char) {
-          await db.update(characters).set({ refresh: Math.max(0, (char.refresh ?? 3) - 1) }).where(eq(characters.id, char.id));
+      const rotateFirstToEnd = () => {
+        if (queue.length > 0) {
+          const first = queue.shift()!;
+          first.ap = 0;
+          queue.push(first);
         }
-      } else if (action === 'pd_add' && currentIdx !== -1) {
-        const char = await db.query.characters.findFirst({ where: eq(characters.id, queue[currentIdx].characterId) });
-        if (char) {
-          await db.update(characters).set({ refresh: (char.refresh ?? 3) + 1 }).where(eq(characters.id, char.id));
+      };
+
+      if (action === 'ap_add' && queue.length > 0) {
+        const current = queue[0];
+        const maxAp = current.maxAp || 3;
+        current.ap += 1;
+        if (current.ap >= maxAp) {
+          rotateFirstToEnd();
         }
-      } else if (action === 'skip' && queue.length > 0) {
-        const nextIdx = currentIdx === -1 ? 0 : (currentIdx + 1) % queue.length;
-        queue.forEach((q, idx) => {
-          q.isCurrent = idx === nextIdx;
-          if (idx === nextIdx) q.ap = 0;
-        });
+      } else if (action === 'ap_sub' && queue.length > 0) {
+        queue[0].ap = Math.max(0, queue[0].ap - 1);
+      } else if (action === 'skip') {
+        rotateFirstToEnd();
       } else if (action === 'up' && selectedIdx > 0) {
         [queue[selectedIdx - 1], queue[selectedIdx]] = [queue[selectedIdx], queue[selectedIdx - 1]];
       } else if (action === 'down' && selectedIdx !== -1 && selectedIdx < queue.length - 1) {
         [queue[selectedIdx + 1], queue[selectedIdx]] = [queue[selectedIdx], queue[selectedIdx + 1]];
-      } else if (action === 'turn' && selectedIdx !== -1) {
-        queue.forEach((q, idx) => {
-          q.isCurrent = idx === selectedIdx;
-          if (idx === selectedIdx) q.ap = 0;
-        });
-      } else if (action === 'del' && selectedIdx !== -1) {
-        const wasCurrent = queue[selectedIdx].isCurrent;
-        queue.splice(selectedIdx, 1);
-        if (wasCurrent && queue.length > 0) {
-          queue[selectedIdx % queue.length].isCurrent = true;
+      } else if (action === 'turn' && selectedIdx > 0) {
+        const [chosen] = queue.splice(selectedIdx, 1);
+        chosen.ap = 0;
+        queue.unshift(chosen);
+      } else if (action === 'maxap_add' && selectedIdx !== -1) {
+        queue[selectedIdx].maxAp = (queue[selectedIdx].maxAp || 3) + 1;
+      } else if (action === 'maxap_sub' && selectedIdx !== -1) {
+        queue[selectedIdx].maxAp = Math.max(1, (queue[selectedIdx].maxAp || 3) - 1);
+        if (queue[selectedIdx].ap >= queue[selectedIdx].maxAp && selectedIdx === 0) {
+          rotateFirstToEnd();
         }
+      } else if (action === 'delchar' && selectedIdx !== -1) {
+        queue.splice(selectedIdx, 1);
+      } else if (action === 'delete') {
+        await db.delete(encounters).where(eq(encounters.id, encounterId));
+        await interaction.update({ content: `🗑️ ${t.encounterDeleted}`, embeds: [], components: [] });
+        return;
+      } else if (action === 'rename') {
+        const modal = new ModalBuilder().setCustomId(`modal_enc_rename_${encounterId}`).setTitle(t.renameEncounter);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('name').setLabel('Name').setStyle(TextInputStyle.Short).setValue(encounter.name).setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+        return;
+      } else if (action === 'scene') {
+        const modal = new ModalBuilder().setCustomId(`modal_enc_scene_${encounterId}`).setTitle(t.editSceneAspects);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('scene_aspects').setLabel(t.sceneAspects).setStyle(TextInputStyle.Paragraph).setValue(encounter.sceneAspects || '').setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+        return;
+      } else if (action === 'newchar') {
+        const modal = new ModalBuilder().setCustomId(`modal_enc_newchar_${encounterId}`).setTitle(t.addNewCharBtn);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('char_name').setLabel('Name').setStyle(TextInputStyle.Short).setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+        return;
       } else if (action === 'stress' && selectedIdx !== -1) {
         const targetCharId = queue[selectedIdx].characterId;
         const character = await db.query.characters.findFirst({ where: eq(characters.id, targetCharId) });
         const phys = (character?.physicalStress as boolean[]) || [false, false, false, false];
         const ment = (character?.mentalStress as boolean[]) || [false, false, false, false];
-
         const physStr = phys.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
         const mentStr = ment.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
 
-        const modal = new ModalBuilder().setCustomId(`modal_btlstress_${targetCharId}_${encounter.id}`).setTitle(`${t.editStress}: ${character?.name}`);
+        const modal = new ModalBuilder().setCustomId(`modal_enc_stress_${targetCharId}_${encounterId}`).setTitle(`${t.editStress}: ${character?.name}`);
         modal.addComponents(
           new ActionRowBuilder<TextInputBuilder>().addComponents(
             new TextInputBuilder().setCustomId('physical').setLabel(`${t.physicalStress} (1-4)`).setValue(physStr).setRequired(false).setStyle(TextInputStyle.Short)
@@ -1160,176 +1351,253 @@ client.on('interactionCreate', async (interaction) => {
         );
         await interaction.showModal(modal);
         return;
-      } else if (action === 'scene') {
-        const modal = new ModalBuilder().setCustomId(`modal_btlscene_${encounter.id}`).setTitle(t.editSceneAspects);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder()
-              .setCustomId('scene_aspects')
-              .setLabel(t.sceneAspects)
-              .setStyle(TextInputStyle.Paragraph)
-              .setValue(encounter.sceneAspects || '')
-              .setRequired(false)
-          )
-        );
-        await interaction.showModal(modal);
+      }
+
+      await db.update(encounters).set({ turnQueue: queue as any }).where(eq(encounters.id, encounterId));
+      const updatedEncounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
+      const payload = await buildEncounterDashboard(updatedEncounter, t);
+      await interaction.update(payload);
+      return;
+    }
+
+    if (id.startsWith('note_')) {
+      const parts = id.split('_');
+      const action = parts[1];
+
+      if (action === 'page') {
+        const vis = parts[2];
+        const page = parseInt(parts[3], 10);
+        const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, page, t);
+        await interaction.update(payload);
         return;
-      } else if (action === 'addchar') {
-        const modal = new ModalBuilder().setCustomId(`modal_btladd_${encounter.id}`).setTitle(t.addNpcBtn);
+      }
+
+      if (action === 'createbtn') {
+        const vis = parts[2];
+        const page = parseInt(parts[3], 10);
+        const modal = new ModalBuilder().setCustomId(`modal_note_create_${vis}_${page}`).setTitle(t.createNoteBtn);
         modal.addComponents(
           new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('char_name').setLabel('Name').setStyle(TextInputStyle.Short).setRequired(true)
+            new TextInputBuilder().setCustomId('title').setLabel(t.noteTitleLabel).setStyle(TextInputStyle.Short).setRequired(true)
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('visibility').setLabel('Visibility (private/public)').setStyle(TextInputStyle.Short).setValue('private').setRequired(true)
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('content').setLabel(t.noteContentLabel).setStyle(TextInputStyle.Paragraph).setRequired(false)
           )
         );
         await interaction.showModal(modal);
         return;
       }
 
-      await db.update(encounters).set({ turnQueue: queue as any }).where(eq(encounters.id, encounter.id));
-      const updatedEncounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounter.id) });
-      const payload = await buildBattleDashboard(updatedEncounter, t);
-      await interaction.update(payload);
+      const noteId = parseInt(parts[2], 10);
+      const vis = parts[3];
+      const page = parseInt(parts[4], 10);
+      const note = await db.query.notes.findFirst({ where: eq(notes.id, noteId) });
+      if (!note) return;
+
+      if (action === 'pin') {
+        await db.update(notes).set({ isPinned: !note.isPinned }).where(eq(notes.id, noteId));
+        const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, page, t);
+        await interaction.update(payload);
+        return;
+      }
+
+      if (action === 'vis') {
+        await db.update(notes).set({ isPublic: !note.isPublic }).where(eq(notes.id, noteId));
+        const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, page, t);
+        await interaction.update(payload);
+        return;
+      }
+
+      if (action === 'edit') {
+        const modal = new ModalBuilder().setCustomId(`modal_note_${noteId}_${vis}_${page}`).setTitle(t.editNote);
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('title').setLabel('Title').setStyle(TextInputStyle.Short).setValue(note.title).setRequired(false)
+          ),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder().setCustomId('content').setLabel('Content').setStyle(TextInputStyle.Paragraph).setValue(note.content || '').setRequired(false)
+          )
+        );
+        await interaction.showModal(modal);
+        return;
+      }
     }
   }
 
-  // ==========================================
-  // 5. MODAL SUBMISSIONS
-  // ==========================================
   if (interaction.isModalSubmit()) {
     const parts = interaction.customId.split('_');
-    const modalType = parts[1];
-    const targetId = parseInt(parts[2], 10);
 
-    if (modalType === 'adv') {
+    if (parts[1] === 'sh') {
+      const fieldType = parts[2];
+      const charId = parseInt(parts[3], 10);
+      const page = parseInt(parts[4], 10);
+
+      if (fieldType === 'name') {
+        const val = interaction.fields.getTextInputValue('value');
+        if (val.trim()) await db.update(characters).set({ name: val.trim() }).where(eq(characters.id, charId));
+      } else if (fieldType === 'refresh') {
+        const val = parseInt(interaction.fields.getTextInputValue('value'), 10);
+        if (!isNaN(val)) await db.update(characters).set({ refresh: val }).where(eq(characters.id, charId));
+      } else if (fieldType === 'desc') {
+        const val = interaction.fields.getTextInputValue('value');
+        await db.update(characters).set({ description: val }).where(eq(characters.id, charId));
+      } else if (fieldType === 'aspects') {
+        const val = interaction.fields.getTextInputValue('value');
+        await db.update(characters).set({ aspects: val }).where(eq(characters.id, charId));
+      } else if (fieldType === 'skills') {
+        const rawText = interaction.fields.getTextInputValue('value');
+        const skillsObj: Record<string, string[]> = {};
+        const lines = rawText.includes('\n') ? rawText.split('\n') : rawText.split('|');
+        lines.forEach(line => {
+          const [mod, list] = line.split(':');
+          if (mod && list) {
+            skillsObj[mod.trim()] = list.split(',').map(s => s.trim()).filter(Boolean);
+          }
+        });
+        await db.update(characters).set({ skills: skillsObj }).where(eq(characters.id, charId));
+      } else if (fieldType === 'stunts') {
+        const val = interaction.fields.getTextInputValue('value');
+        await db.update(characters).set({ stunts: val }).where(eq(characters.id, charId));
+      } else if (fieldType === 'extras') {
+        const val = interaction.fields.getTextInputValue('value');
+        await db.update(characters).set({ extras: val }).where(eq(characters.id, charId));
+      } else if (fieldType === 'cons') {
+        const mild = interaction.fields.getTextInputValue('mild');
+        const moderate = interaction.fields.getTextInputValue('moderate');
+        const severe = interaction.fields.getTextInputValue('severe');
+        await db.update(characters).set({ consequences: { mild, moderate, severe } }).where(eq(characters.id, charId));
+      } else if (fieldType === 'stress') {
+        const physInput = interaction.fields.getTextInputValue('physical').split(',').map(s => parseInt(s.trim(), 10));
+        const mentInput = interaction.fields.getTextInputValue('mental').split(',').map(s => parseInt(s.trim(), 10));
+        const physical = [1, 2, 3, 4].map(n => physInput.includes(n));
+        const mental = [1, 2, 3, 4].map(n => mentInput.includes(n));
+        await db.update(characters).set({ physicalStress: physical as any, mentalStress: mental as any }).where(eq(characters.id, charId));
+      }
+
+      const updatedChar = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
+      const sheetRef = activeSheetInteractions.get(`${interaction.user.id}_${charId}`);
+
+      if (updatedChar && sheetRef) {
+        const payload = buildSheetPagePayload(updatedChar, page, t);
+        await interaction.deferUpdate();
+        await sheetRef.interaction.editReply(payload);
+      } else {
+        await interaction.reply({ content: '✅ Updated.', ephemeral: true });
+      }
+      return;
+    }
+
+    if (parts[1] === 'adv') {
+      const advId = parseInt(parts[2], 10);
       const name = interaction.fields.getTextInputValue('name');
       const description = interaction.fields.getTextInputValue('description');
       const activeRaw = interaction.fields.getTextInputValue('is_active').toLowerCase().trim();
       const isActive = activeRaw === 'true' || activeRaw === '1' || activeRaw === 'yes' || activeRaw === 'si';
 
-      await db.update(adventures).set({ name, description, isActive }).where(eq(adventures.id, targetId));
-      await interaction.reply({ content: 'Adventure updated.', ephemeral: true });
+      await db.update(adventures).set({ name, description, isActive }).where(eq(adventures.id, advId));
+      await interaction.reply({ content: '✅ Adventure updated.', ephemeral: true });
+      return;
     }
 
-    if (modalType === 'id') {
-      const name = interaction.fields.getTextInputValue('name');
-      const description = interaction.fields.getTextInputValue('description');
-      const refreshStr = interaction.fields.getTextInputValue('refresh');
-      const refresh = refreshStr ? parseInt(refreshStr, 10) : 3;
+    if (parts[1] === 'enc') {
+      const subAction = parts[2];
 
-      await db.update(characters).set({ name, description, refresh }).where(eq(characters.id, targetId));
-      await interaction.reply({ content: 'Character ID updated.', ephemeral: true });
-    }
-
-    if (modalType === 'aspects') {
-      const aspects = interaction.fields.getTextInputValue('aspects');
-      await db.update(characters).set({ aspects }).where(eq(characters.id, targetId));
-      await interaction.reply({ content: 'Aspects updated.', ephemeral: true });
-    }
-
-    if (modalType === 'skills') {
-      const rawText = interaction.fields.getTextInputValue('skills_text');
-      const skillsObj: Record<string, string[]> = {};
-
-      const lines = rawText.includes('\n') ? rawText.split('\n') : rawText.split('|');
-      lines.forEach(line => {
-        const [mod, list] = line.split(':');
-        if (mod && list) {
-          skillsObj[mod.trim()] = list.split(',').map(s => s.trim()).filter(Boolean);
+      if (subAction === 'rename') {
+        const encounterId = parseInt(parts[3], 10);
+        const name = interaction.fields.getTextInputValue('name').trim();
+        if (name) {
+          await db.update(encounters).set({ name }).where(eq(encounters.id, encounterId));
+          await refreshEncounterMessage(encounterId, t);
         }
-      });
-      await db.update(characters).set({ skills: skillsObj }).where(eq(characters.id, targetId));
-      await interaction.reply({ content: 'Skills updated.', ephemeral: true });
-    }
+        await interaction.deferUpdate();
+      } else if (subAction === 'scene') {
+        const encounterId = parseInt(parts[3], 10);
+        const sceneAspects = interaction.fields.getTextInputValue('scene_aspects');
+        await db.update(encounters).set({ sceneAspects }).where(eq(encounters.id, encounterId));
+        await refreshEncounterMessage(encounterId, t);
+        await interaction.deferUpdate();
+      } else if (subAction === 'newchar') {
+        const encounterId = parseInt(parts[3], 10);
+        const charName = interaction.fields.getTextInputValue('char_name').trim();
+        const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
+        if (encounter && charName) {
+          let character = await db.query.characters.findFirst({
+            where: and(eq(characters.name, charName), eq(characters.guildId, interaction.guildId))
+          });
+          if (!character) {
+            const [created] = await db
+              .insert(characters)
+              .values({ guildId: interaction.guildId, adventureId: encounter.adventureId, name: charName })
+              .returning();
+            character = created;
+          }
+          const queue = (encounter.turnQueue as QueueItem[]) || [];
+          if (!queue.some(q => q.characterId === character!.id)) {
+            queue.push({ characterId: character.id, ap: 0, maxAp: 3 });
+          }
+          await db
+            .update(encounters)
+            .set({ turnQueue: queue as any, selectedCharId: encounter.selectedCharId || character.id })
+            .where(eq(encounters.id, encounterId));
+          await refreshEncounterMessage(encounterId, t);
+        }
+        await interaction.deferUpdate();
+      } else if (subAction === 'stress') {
+        const targetCharId = parseInt(parts[3], 10);
+        const encounterId = parseInt(parts[4], 10);
+        const physInput = interaction.fields.getTextInputValue('physical').split(',').map(s => parseInt(s.trim(), 10));
+        const mentInput = interaction.fields.getTextInputValue('mental').split(',').map(s => parseInt(s.trim(), 10));
+        const physical = [1, 2, 3, 4].map(n => physInput.includes(n));
+        const mental = [1, 2, 3, 4].map(n => mentInput.includes(n));
 
-    if (modalType === 'stunts') {
-      const stunts = interaction.fields.getTextInputValue('stunts');
-      await db.update(characters).set({ stunts }).where(eq(characters.id, targetId));
-      await interaction.reply({ content: 'Stunts updated.', ephemeral: true });
-    }
-
-    if (modalType === 'extras') {
-      const extras = interaction.fields.getTextInputValue('extras');
-      await db.update(characters).set({ extras }).where(eq(characters.id, targetId));
-      await interaction.reply({ content: 'Extras updated.', ephemeral: true });
-    }
-
-    if (modalType === 'stress') {
-      const physInput = interaction.fields.getTextInputValue('physical').split(',').map(s => parseInt(s.trim(), 10));
-      const mentInput = interaction.fields.getTextInputValue('mental').split(',').map(s => parseInt(s.trim(), 10));
-      const physical = [1, 2, 3, 4].map(n => physInput.includes(n));
-      const mental = [1, 2, 3, 4].map(n => mentInput.includes(n));
-      await db.update(characters).set({ physicalStress: physical as any, mentalStress: mental as any }).where(eq(characters.id, targetId));
-      await interaction.reply({ content: 'Stress updated.', ephemeral: true });
-    }
-
-    if (modalType === 'consequences') {
-      const mild = interaction.fields.getTextInputValue('mild');
-      const moderate = interaction.fields.getTextInputValue('moderate');
-      const severe = interaction.fields.getTextInputValue('severe');
-      await db.update(characters).set({ consequences: { mild, moderate, severe } }).where(eq(characters.id, targetId));
-      await interaction.reply({ content: 'Consequences updated.', ephemeral: true });
-    }
-
-    // Modales del sistema de combate (actualizan personaje/escena y refrescan dashboard)
-    if (modalType === 'btlstress') {
-      const encounterId = parseInt(parts[3], 10);
-      const physInput = interaction.fields.getTextInputValue('physical').split(',').map(s => parseInt(s.trim(), 10));
-      const mentInput = interaction.fields.getTextInputValue('mental').split(',').map(s => parseInt(s.trim(), 10));
-      const physical = [1, 2, 3, 4].map(n => physInput.includes(n));
-      const mental = [1, 2, 3, 4].map(n => mentInput.includes(n));
-
-      await db.update(characters).set({ physicalStress: physical as any, mentalStress: mental as any }).where(eq(characters.id, targetId));
-      await refreshEncounterMessage(encounterId, t);
-      await interaction.reply({ content: 'Stress updated.', ephemeral: true });
-    }
-
-    if (modalType === 'btlscene') {
-      const sceneAspects = interaction.fields.getTextInputValue('scene_aspects');
-      await db.update(encounters).set({ sceneAspects }).where(eq(encounters.id, targetId));
-      await refreshEncounterMessage(targetId, t);
-      await interaction.reply({ content: 'Scene aspects updated.', ephemeral: true });
-    }
-
-    if (modalType === 'btladd') {
-      const charName = interaction.fields.getTextInputValue('char_name').trim();
-      const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, targetId) });
-      if (!encounter) return;
-
-      let character = await db.query.characters.findFirst({
-        where: and(eq(characters.name, charName), eq(characters.guildId, interaction.guildId))
-      });
-
-      if (!character) {
-        const [created] = await db
-          .insert(characters)
-          .values({
-            guildId: interaction.guildId,
-            adventureId: encounter.adventureId,
-            name: charName
-          })
-          .returning();
-        character = created;
+        await db.update(characters).set({ physicalStress: physical as any, mentalStress: mental as any }).where(eq(characters.id, targetCharId));
+        await refreshEncounterMessage(encounterId, t);
+        await interaction.deferUpdate();
       }
+      return;
+    }
 
-      const queue = (encounter.turnQueue as QueueItem[]) || [];
-      if (!queue.some(q => q.characterId === character!.id)) {
-        queue.push({
-          characterId: character.id,
-          ap: 0,
-          isCurrent: queue.length === 0
+    if (parts[1] === 'note') {
+      if (parts[2] === 'create') {
+        const vis = parts[3];
+        const page = parseInt(parts[4], 10);
+        const title = interaction.fields.getTextInputValue('title').trim();
+        const visInput = interaction.fields.getTextInputValue('visibility').toLowerCase().trim();
+        const content = interaction.fields.getTextInputValue('content');
+        const isPublic = visInput === 'public' || visInput === 'publica';
+
+        const activeAdventure = await db.query.adventures.findFirst({
+          where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
         });
+
+        await db.insert(notes).values({
+          guildId: interaction.guildId,
+          adventureId: activeAdventure?.id || null,
+          authorId: interaction.user.id,
+          title: title || 'Untitled',
+          content,
+          isPublic
+        });
+
+        const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, page, t);
+        await interaction.deferUpdate();
+        await interaction.editReply(payload);
+        return;
       }
 
-      await db
-        .update(encounters)
-        .set({
-          turnQueue: queue as any,
-          selectedCharId: encounter.selectedCharId || character.id
-        })
-        .where(eq(encounters.id, encounter.id));
+      const noteId = parseInt(parts[2], 10);
+      const vis = parts[3];
+      const page = parseInt(parts[4], 10);
+      const title = interaction.fields.getTextInputValue('title').trim();
+      const content = interaction.fields.getTextInputValue('content');
 
-      await refreshEncounterMessage(encounter.id, t);
-      await interaction.reply({ content: `✅ **${character.name}** added.`, ephemeral: true });
+      await db.update(notes).set({ title: title || 'Untitled', content }).where(eq(notes.id, noteId));
+      const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, page, t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
     }
   }
 });

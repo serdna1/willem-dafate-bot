@@ -1,4 +1,4 @@
-import { pgTable, text, integer, serial, jsonb, boolean } from 'drizzle-orm/pg-core';
+import { pgTable, text, integer, serial, jsonb, boolean, timestamp } from 'drizzle-orm/pg-core';
 
 export const adventures = pgTable('adventures', {
   id: serial('id').primaryKey(),
@@ -34,7 +34,19 @@ export const encounters = pgTable('encounters', {
   sceneAspects: text('scene_aspects').default(''),
   channelId: text('channel_id'),
   messageId: text('message_id'),
-  isActive: boolean('is_active').default(true),
   selectedCharId: integer('selected_char_id'),
   turnQueue: jsonb('turn_queue').default([]),
+  createdAt: timestamp('created_at').defaultNow(),
+});
+
+export const notes = pgTable('notes', {
+  id: serial('id').primaryKey(),
+  guildId: text('guild_id').notNull(),
+  adventureId: integer('adventure_id').references(() => adventures.id),
+  authorId: text('author_id').notNull(),
+  title: text('title').notNull(),
+  content: text('content').default(''),
+  isPublic: boolean('is_public').default(false),
+  isPinned: boolean('is_pinned').default(false),
+  createdAt: timestamp('created_at').defaultNow(),
 });
