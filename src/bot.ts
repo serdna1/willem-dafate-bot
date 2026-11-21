@@ -1,5 +1,6 @@
 import {
   Client,
+  Events,
   GatewayIntentBits,
   ActionRowBuilder,
   ButtonBuilder,
@@ -7,15 +8,20 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  LabelBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  CheckboxGroupBuilder,
+  CheckboxBuilder,
+  TextDisplayBuilder,
   EmbedBuilder,
   ApplicationCommandOptionType,
   ApplicationCommandType,
-  StringSelectMenuBuilder,
   TextChannel
 } from 'discord.js';
 import { db } from './db/index.js';
 import { characters, adventures, encounters, notes } from './db/schema.js';
-import { eq, and, desc, or } from 'drizzle-orm';
+import { eq, and, desc } from 'drizzle-orm';
 import { getTranslation } from './i18n.js';
 
 const client = new Client({
@@ -33,7 +39,25 @@ interface QueueItem {
   maxAp: number;
 }
 
+interface PendingRollData {
+  results: string[];
+  total: number;
+  detail: string;
+  user: string;
+}
+
 const activeSheetInteractions = new Map<string, { interaction: any; page: number }>();
+
+// Almacén en memoria para tiradas ocultas/privadas (evita superar el límite de 100 caracteres del custom_id de Discord)
+const pendingRolls = new Map<string, PendingRollData>();
+
+function storePendingRoll(data: PendingRollData): string {
+  const id = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  pendingRolls.set(id, data);
+  // Limpieza automática tras 24 horas
+  setTimeout(() => pendingRolls.delete(id), 24 * 60 * 60 * 1000);
+  return id;
+}
 
 async function getGuildLanguage(guildId: string): Promise<string> {
   const activeAdv = await db.query.adventures.findFirst({
@@ -46,7 +70,7 @@ function rollDice(diceCount: number, modifier: number = 0) {
   const faces = ['-', '0', '+'];
   const values = { '-': -1, '0': 0, '+': 1 };
   let total = 0;
-  const results = [];
+  const results: string[] = [];
 
   for (let i = 0; i < diceCount; i++) {
     const face = faces[Math.floor(Math.random() * faces.length)];
@@ -62,7 +86,6 @@ async function parseAndExecuteRoll(
   userId: string,
   allowPrivateS: boolean
 ) {
-  // Regex corregido para capturar correctamente: 4df, 4dfs(+n/skill), 4dfss, etc.
   const regex = /^(\d+)df(ss|s)?(?:\s+(.*)|([+-]\d+))?$/i;
   const match = rawExpression.trim().match(regex);
   if (!match) return null;
@@ -70,10 +93,9 @@ async function parseAndExecuteRoll(
   const diceCount = parseInt(match[1], 10);
   if (diceCount < 1 || diceCount > 100) return null;
 
-  const mode = (match[2] || '').toLowerCase(); // '' | 's' | 'ss'
+  const mode = (match[2] || '').toLowerCase();
   if (mode === 's' && !allowPrivateS) return null;
 
-  // Si hizo match con el grupo 3 (texto/habilidad/mod) o grupo 4 (modificador directo sin espacio ej: 4dfs+2)
   const rest = (match[3] || match[4] || '').trim();
   let modifier = 0;
   let labelDetail = '';
@@ -135,6 +157,48 @@ async function parseAndExecuteRoll(
     total: roll.total,
     labelDetail
   };
+}
+
+/**
+ * Helper para construir el modal de estrés con CheckboxGroups (1, 2, 3, 4)
+ */
+function buildStressModal(customId: string, title: string, character: any, t: any) {
+  const phys = (character?.physicalStress as boolean[]) || [false, false, false, false];
+  const ment = (character?.mentalStress as boolean[]) || [false, false, false, false];
+
+  const physGroup = new CheckboxGroupBuilder()
+    .setCustomId('physical')
+    .setMinValues(0)
+    .setMaxValues(4)
+    .setRequired(false)
+    .setOptions(
+      [1, 2, 3, 4].map((num, idx) => ({
+        label: String(num),
+        value: String(num),
+        default: Boolean(phys[idx])
+      }))
+    );
+
+  const mentGroup = new CheckboxGroupBuilder()
+    .setCustomId('mental')
+    .setMinValues(0)
+    .setMaxValues(4)
+    .setRequired(false)
+    .setOptions(
+      [1, 2, 3, 4].map((num, idx) => ({
+        label: String(num),
+        value: String(num),
+        default: Boolean(ment[idx])
+      }))
+    );
+
+  return new ModalBuilder()
+    .setCustomId(customId)
+    .setTitle(title.slice(0, 45))
+    .addLabelComponents(
+      new LabelBuilder().setLabel(t.physicalStress).setCheckboxGroupComponent(physGroup),
+      new LabelBuilder().setLabel(t.mentalStress).setCheckboxGroupComponent(mentGroup)
+    );
 }
 
 function buildSheetPagePayload(character: any, page: number, t: any) {
@@ -273,7 +337,7 @@ async function buildEncounterDashboard(encounter: any, t: any) {
   }
 
   if (queue.length === 0) {
-    descriptionLines.push('_No participants yet. Select an existing character or create a new one below._');
+    descriptionLines.push('_No participants yet. Click "Add Character" below._');
   } else {
     queue.forEach((item, index) => {
       const char = charMap.get(item.characterId);
@@ -338,35 +402,16 @@ async function buildEncounterDashboard(encounter: any, t: any) {
     const row4 = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`enc_maxap_add_${encounter.id}`).setLabel(`+1 ${t.maxAp}`).setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`enc_maxap_sub_${encounter.id}`).setLabel(`-1 ${t.maxAp}`).setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`enc_newchar_${encounter.id}`).setLabel(`➕ ${t.addNewCharBtn}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_addchar_${encounter.id}`).setLabel(`➕ ${t.addCharBtn}`).setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId(`enc_delete_${encounter.id}`).setLabel(`🗑️ ${t.deleteEncounter}`).setStyle(ButtonStyle.Danger)
     );
     components.push(row4);
   } else {
     const rowEmpty = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`enc_newchar_${encounter.id}`).setLabel(`➕ ${t.addNewCharBtn}`).setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`enc_addchar_${encounter.id}`).setLabel(`➕ ${t.addCharBtn}`).setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId(`enc_delete_${encounter.id}`).setLabel(`🗑️ ${t.deleteEncounter}`).setStyle(ButtonStyle.Danger)
     );
     components.push(rowEmpty);
-  }
-
-  const existingChars = allChars
-    .filter(c => c.adventureId === encounter.adventureId && !queue.some(q => q.characterId === c.id))
-    .slice(0, 25);
-
-  if (existingChars.length > 0 && components.length < 5) {
-    const addExistingMenu = new StringSelectMenuBuilder()
-      .setCustomId(`enc_addexisting_${encounter.id}`)
-      .setPlaceholder(t.addExistingPlaceholder);
-
-    existingChars.forEach(c => {
-      addExistingMenu.addOptions({
-        label: c.name,
-        value: String(c.id)
-      });
-    });
-
-    components.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(addExistingMenu));
   }
 
   return { embeds: [embed], components };
@@ -447,12 +492,10 @@ async function buildNotesListPayload(guildId: string, userId: string, visibility
     orderBy: [desc(notes.isPinned), desc(notes.createdAt), desc(notes.id)]
   });
 
-  // Si no se filtra específicamente por 'private', mostramos públicas + las privadas del usuario actual
   const filtered = allNotes.filter(n => {
     if (visibilityFilter === 'private') {
       return !n.isPublic && n.authorId === userId;
     }
-    // Si es 'public' (por defecto), muestra las públicas y las privadas propias del usuario
     return n.isPublic === true || n.authorId === userId;
   });
 
@@ -472,8 +515,7 @@ async function buildNotesListPayload(guildId: string, userId: string, visibility
     for (const n of slice) {
       const pinIcon = n.isPinned ? '📌 ' : '';
       let contentPreview = n.content && n.content.trim() !== '' ? n.content : '_Empty_';
-      
-      // Limitar a aproximadamente 3 líneas o 200 caracteres para la vista previa
+
       const lines = contentPreview.split('\n');
       if (lines.length > 3) {
         contentPreview = lines.slice(0, 3).join('\n') + '\n...';
@@ -482,7 +524,6 @@ async function buildNotesListPayload(guildId: string, userId: string, visibility
         contentPreview = contentPreview.slice(0, 250) + '...';
       }
 
-      // Obtener nombre del autor
       let authorName = 'Unknown';
       try {
         const userObj = await client.users.fetch(n.authorId);
@@ -528,7 +569,6 @@ async function buildNotesListPayload(guildId: string, userId: string, visibility
     components.push(editRow, pinRow, visRow);
   }
 
-  // Fila extra con botón para crear nota nueva desde la interfaz de /notas
   const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`note_createbtn_${visibilityFilter}_${safePage}`)
@@ -554,10 +594,10 @@ async function buildNotesListPayload(guildId: string, userId: string, visibility
   return { embeds: [embed], components };
 }
 
-client.on('ready', async () => {
-  console.log(`Logged in as ${client.user?.tag}`);
+client.once(Events.ClientReady, async (readyClient) => {
+  console.log(`Logged in as ${readyClient.user.tag}`);
 
-  await client.application?.commands.set([
+  await readyClient.application.commands.set([
     {
       name: 'roll',
       description: 'Roll Fate dice (supports 4df, 4dfs, 4dfss, modifiers, skills and character names)',
@@ -681,7 +721,7 @@ client.on('ready', async () => {
   ]);
 });
 
-client.on('messageCreate', async (message) => {
+client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guildId) return;
   const text = message.content.trim();
 
@@ -702,17 +742,15 @@ client.on('messageCreate', async (message) => {
   const detailText = rollOutcome.labelDetail ? ` (${rollOutcome.labelDetail})` : '';
 
   if (rollOutcome.mode === 'ss') {
-    const payloadData = Buffer.from(
-      JSON.stringify({
-        r: rollOutcome.results,
-        t: rollOutcome.total,
-        d: detailText,
-        user: message.author.username
-      })
-    ).toString('base64');
+    const rollId = storePendingRoll({
+      results: rollOutcome.results,
+      total: rollOutcome.total,
+      detail: detailText,
+      user: message.author.username
+    });
 
     const revealBtn = new ButtonBuilder()
-      .setCustomId(`reveal_ss_${payloadData}`)
+      .setCustomId(`reveal_ss_${rollId}`)
       .setLabel(t.showRoll)
       .setStyle(ButtonStyle.Secondary);
 
@@ -733,11 +771,14 @@ client.on('messageCreate', async (message) => {
   await message.reply({ embeds: [embed] });
 });
 
-client.on('interactionCreate', async (interaction) => {
+client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.guildId) return;
   const lang = await getGuildLanguage(interaction.guildId);
   const t = getTranslation(lang);
 
+  // ==========================================
+  // 1. SLASH COMMANDS
+  // ==========================================
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
 
@@ -759,17 +800,15 @@ client.on('interactionCreate', async (interaction) => {
       const detailText = rollOutcome.labelDetail ? ` (${rollOutcome.labelDetail})` : '';
 
       if (rollOutcome.mode === 's') {
-        const payloadData = Buffer.from(
-          JSON.stringify({
-            r: rollOutcome.results,
-            t: rollOutcome.total,
-            d: detailText,
-            user: interaction.user.username
-          })
-        ).toString('base64');
+        const rollId = storePendingRoll({
+          results: rollOutcome.results,
+          total: rollOutcome.total,
+          detail: detailText,
+          user: interaction.user.username
+        });
 
         const revealBtn = new ButtonBuilder()
-          .setCustomId(`reveal_private_${payloadData}`)
+          .setCustomId(`reveal_priv_${rollId}`)
           .setLabel(t.showRoll)
           .setStyle(ButtonStyle.Primary);
 
@@ -784,17 +823,15 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (rollOutcome.mode === 'ss') {
-        const payloadData = Buffer.from(
-          JSON.stringify({
-            r: rollOutcome.results,
-            t: rollOutcome.total,
-            d: detailText,
-            user: interaction.user.username
-          })
-        ).toString('base64');
+        const rollId = storePendingRoll({
+          results: rollOutcome.results,
+          total: rollOutcome.total,
+          detail: detailText,
+          user: interaction.user.username
+        });
 
         const revealBtn = new ButtonBuilder()
-          .setCustomId(`reveal_ss_${payloadData}`)
+          .setCustomId(`reveal_ss_${rollId}`)
           .setLabel(t.showRoll)
           .setStyle(ButtonStyle.Secondary);
 
@@ -996,6 +1033,9 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
+  // ==========================================
+  // 2. USER CONTEXT MENU
+  // ==========================================
   if (interaction.isUserContextMenuCommand() && interaction.commandName === 'View Character Sheet') {
     const character = await db.query.characters.findFirst({
       where: and(eq(characters.discordUserId, interaction.targetId), eq(characters.guildId, interaction.guildId))
@@ -1009,6 +1049,9 @@ client.on('interactionCreate', async (interaction) => {
     activeSheetInteractions.set(`${interaction.user.id}_${character.id}`, { interaction, page: 0 });
   }
 
+  // ==========================================
+  // 3. SELECT MENUS (MENSAJES)
+  // ==========================================
   if (interaction.isStringSelectMenu()) {
     if (interaction.customId.startsWith('enc_select_')) {
       const encounterId = parseInt(interaction.customId.split('_')[2], 10);
@@ -1021,57 +1064,50 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.update(payload);
       }
     }
-
-    if (interaction.customId.startsWith('enc_addexisting_')) {
-      const encounterId = parseInt(interaction.customId.split('_')[2], 10);
-      const charIdToAdd = parseInt(interaction.values[0], 10);
-
-      const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
-      if (encounter) {
-        const queue = (encounter.turnQueue as QueueItem[]) || [];
-        if (!queue.some(q => q.characterId === charIdToAdd)) {
-          queue.push({ characterId: charIdToAdd, ap: 0, maxAp: 3 });
-        }
-        await db
-          .update(encounters)
-          .set({
-            turnQueue: queue as any,
-            selectedCharId: encounter.selectedCharId || charIdToAdd
-          })
-          .where(eq(encounters.id, encounterId));
-
-        const updated = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
-        const payload = await buildEncounterDashboard(updated, t);
-        await interaction.update(payload);
-      }
-    }
   }
 
+  // ==========================================
+  // 4. BUTTONS
+  // ==========================================
   if (interaction.isButton()) {
     const id = interaction.customId;
 
+    // 4.1 Revelar tiradas (usando ID corto de pendingRolls)
     if (id.startsWith('reveal_ss_')) {
-      const data = JSON.parse(Buffer.from(id.replace('reveal_ss_', ''), 'base64').toString('utf8'));
+      const rollId = id.replace('reveal_ss_', '');
+      const data = pendingRolls.get(rollId);
+      if (!data) {
+        await interaction.reply({ content: t.rollExpired, ephemeral: true });
+        return;
+      }
+      pendingRolls.delete(rollId);
       await interaction.update({
-        content: `🎲 **${data.user}** ${t.revealedRoll}:\n[ ${data.r.join(' , ')} ]${data.d}\n\n**Total:** \`${data.t}\``,
+        content: `🎲 **${data.user}** ${t.revealedRoll}:\n[ ${data.results.join(' , ')} ]${data.detail}\n\n**Total:** \`${data.total}\``,
         components: []
       });
       return;
     }
 
-    if (id.startsWith('reveal_private_')) {
-      const data = JSON.parse(Buffer.from(id.replace('reveal_private_', ''), 'base64').toString('utf8'));
+    if (id.startsWith('reveal_priv_')) {
+      const rollId = id.replace('reveal_priv_', '');
+      const data = pendingRolls.get(rollId);
+      if (!data) {
+        await interaction.reply({ content: t.rollExpired, ephemeral: true });
+        return;
+      }
+      pendingRolls.delete(rollId);
       await interaction.update({
         content: `✅ Shared with channel.`,
         components: []
       });
       await interaction.followUp({
-        content: `🎲 **${data.user}** ${t.revealedRoll}:\n[ ${data.r.join(' , ')} ]${data.d}\n\n**Total:** \`${data.t}\``,
+        content: `🎲 **${data.user}** ${t.revealedRoll}:\n[ ${data.results.join(' , ')} ]${data.detail}\n\n**Total:** \`${data.total}\``,
         ephemeral: false
       });
       return;
     }
 
+    // 4.2 Tirada de habilidad desde ficha
     if (id.startsWith('skill_roll_')) {
       const [, , charIdStr, skillName] = id.split('_');
       const charId = parseInt(charIdStr, 10);
@@ -1095,6 +1131,7 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    // 4.3 Paginación y Edición de Ficha (/sheet) con LabelBuilder y nuevos componentes de Modal
     if (id.startsWith('sh_page_')) {
       const [, , charIdStr, pageStr] = id.split('_');
       const charId = parseInt(charIdStr, 10);
@@ -1119,123 +1156,215 @@ client.on('interactionCreate', async (interaction) => {
       if (!character) return;
 
       if (fieldType === 'name') {
-        const modal = new ModalBuilder().setCustomId(`modal_sh_name_${charId}_${page}`).setTitle(t.editName);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('value').setLabel(t.editName).setStyle(TextInputStyle.Short).setValue(character.name || '').setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_sh_name_${charId}_${page}`)
+          .setTitle(t.editName)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.editName)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('value')
+                  .setStyle(TextInputStyle.Short)
+                  .setMaxLength(100)
+                  .setValue(character.name || '')
+                  .setRequired(true)
+              )
+          );
         await interaction.showModal(modal);
       } else if (fieldType === 'refresh') {
-        const modal = new ModalBuilder().setCustomId(`modal_sh_refresh_${charId}_${page}`).setTitle(t.editRefresh);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('value').setLabel(t.refresh).setStyle(TextInputStyle.Short).setValue(String(character.refresh ?? 3)).setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_sh_refresh_${charId}_${page}`)
+          .setTitle(t.editRefresh)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.refresh)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('value')
+                  .setStyle(TextInputStyle.Short)
+                  .setMaxLength(10)
+                  .setValue(String(character.refresh ?? 3))
+                  .setRequired(true)
+              )
+          );
         await interaction.showModal(modal);
       } else if (fieldType === 'desc') {
-        const modal = new ModalBuilder().setCustomId(`modal_sh_desc_${charId}_${page}`).setTitle(t.editDescription);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('value').setLabel(t.description).setStyle(TextInputStyle.Paragraph).setValue(character.description || '').setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_sh_desc_${charId}_${page}`)
+          .setTitle(t.editDescription)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.description)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('value')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(1000)
+                  .setValue(character.description || '')
+                  .setRequired(false)
+              )
+          );
         await interaction.showModal(modal);
       } else if (fieldType === 'aspects') {
-        const modal = new ModalBuilder().setCustomId(`modal_sh_aspects_${charId}_${page}`).setTitle(t.editAspects);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('value').setLabel(t.aspects).setStyle(TextInputStyle.Paragraph).setValue(character.aspects || '').setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_sh_aspects_${charId}_${page}`)
+          .setTitle(t.editAspects)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.aspects)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('value')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(1000)
+                  .setValue(character.aspects || '')
+                  .setRequired(false)
+              )
+          );
         await interaction.showModal(modal);
       } else if (fieldType === 'skills') {
         const skillsObj = (character.skills as Record<string, string[]>) || {};
         const lines = Object.entries(skillsObj).map(([mod, list]) => `${mod}: ${list.join(', ')}`);
-        const modal = new ModalBuilder().setCustomId(`modal_sh_skills_${charId}_${page}`).setTitle(t.editSkills);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder()
-              .setCustomId('value')
-              .setLabel('Format: +4: Skill1, Skill2')
-              .setPlaceholder('+4: Shoot, Athletics\n+3: Empathy')
-              .setStyle(TextInputStyle.Paragraph)
-              .setValue(lines.join('\n'))
-              .setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_sh_skills_${charId}_${page}`)
+          .setTitle(t.editSkills)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.skills)
+              .setDescription('Format: +4: Skill1, Skill2')
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('value')
+                  .setPlaceholder('+4: Shoot, Athletics\n+3: Empathy')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(1000)
+                  .setValue(lines.join('\n'))
+                  .setRequired(false)
+              )
+          );
         await interaction.showModal(modal);
       } else if (fieldType === 'stunts') {
-        const modal = new ModalBuilder().setCustomId(`modal_sh_stunts_${charId}_${page}`).setTitle(t.editStunts);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('value').setLabel(t.stunts).setStyle(TextInputStyle.Paragraph).setValue(character.stunts || '').setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_sh_stunts_${charId}_${page}`)
+          .setTitle(t.editStunts)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.stunts)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('value')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(1500)
+                  .setValue(character.stunts || '')
+                  .setRequired(false)
+              )
+          );
         await interaction.showModal(modal);
       } else if (fieldType === 'extras') {
-        const modal = new ModalBuilder().setCustomId(`modal_sh_extras_${charId}_${page}`).setTitle(t.editExtras);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('value').setLabel(t.extras).setStyle(TextInputStyle.Paragraph).setValue(character.extras || '').setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_sh_extras_${charId}_${page}`)
+          .setTitle(t.editExtras)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.extras)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('value')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(1500)
+                  .setValue(character.extras || '')
+                  .setRequired(false)
+              )
+          );
         await interaction.showModal(modal);
       } else if (fieldType === 'cons') {
         const cons = (character.consequences as { mild: string; moderate: string; severe: string }) || { mild: '', moderate: '', severe: '' };
-        const modal = new ModalBuilder().setCustomId(`modal_sh_cons_${charId}_${page}`).setTitle(t.editConsequences);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('mild').setLabel(t.mild).setStyle(TextInputStyle.Short).setValue(cons.mild || '').setRequired(false)
-          ),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('moderate').setLabel(t.moderate).setStyle(TextInputStyle.Short).setValue(cons.moderate || '').setRequired(false)
-          ),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('severe').setLabel(t.severe).setStyle(TextInputStyle.Short).setValue(cons.severe || '').setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_sh_cons_${charId}_${page}`)
+          .setTitle(t.editConsequences)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.mild)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('mild')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(500)
+                  .setValue(cons.mild || '')
+                  .setRequired(false)
+              ),
+            new LabelBuilder()
+              .setLabel(t.moderate)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('moderate')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(500)
+                  .setValue(cons.moderate || '')
+                  .setRequired(false)
+              ),
+            new LabelBuilder()
+              .setLabel(t.severe)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('severe')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(500)
+                  .setValue(cons.severe || '')
+                  .setRequired(false)
+              )
+          );
         await interaction.showModal(modal);
       } else if (fieldType === 'stress') {
-        const phys = (character.physicalStress as boolean[]) || [false, false, false, false];
-        const ment = (character.mentalStress as boolean[]) || [false, false, false, false];
-        const physStr = phys.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
-        const mentStr = ment.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
-
-        const modal = new ModalBuilder().setCustomId(`modal_sh_stress_${charId}_${page}`).setTitle(t.editStress);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('physical').setLabel(`${t.physicalStress} (1-4)`).setStyle(TextInputStyle.Short).setValue(physStr).setRequired(false)
-          ),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('mental').setLabel(`${t.mentalStress} (1-4)`).setStyle(TextInputStyle.Short).setValue(mentStr).setRequired(false)
-          )
-        );
+        const modal = buildStressModal(`modal_sh_stress_${charId}_${page}`, t.editStress, character, t);
         await interaction.showModal(modal);
       }
       return;
     }
 
+    // 4.4 Editar Aventura (/adventure-info) con CheckboxBuilder
     if (id.startsWith('edit_adv_')) {
       const advId = parseInt(id.split('_')[2], 10);
       const adv = await db.query.adventures.findFirst({ where: eq(adventures.id, advId) });
-      const modal = new ModalBuilder().setCustomId(`modal_adv_${advId}`).setTitle(t.editAdventure);
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('name').setLabel('Name').setStyle(TextInputStyle.Short).setValue(adv?.name || '').setRequired(false)
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('description').setLabel(t.description).setStyle(TextInputStyle.Paragraph).setValue(adv?.description || '').setRequired(false)
-        ),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('is_active').setLabel('Active? (true / false)').setStyle(TextInputStyle.Short).setValue(String(adv?.isActive ?? true)).setRequired(false)
-        )
-      );
+
+      const modal = new ModalBuilder()
+        .setCustomId(`modal_adv_${advId}`)
+        .setTitle(t.editAdventure)
+        .addLabelComponents(
+          new LabelBuilder()
+            .setLabel('Name')
+            .setTextInputComponent(
+              new TextInputBuilder()
+                .setCustomId('name')
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(100)
+                .setValue(adv?.name || '')
+                .setRequired(true)
+            ),
+          new LabelBuilder()
+            .setLabel(t.description)
+            .setTextInputComponent(
+              new TextInputBuilder()
+                .setCustomId('description')
+                .setStyle(TextInputStyle.Paragraph)
+                .setMaxLength(1000)
+                .setValue(adv?.description || '')
+                .setRequired(false)
+            ),
+          new LabelBuilder()
+            .setLabel(t.activateLabel)
+            .setCheckboxComponent(
+              new CheckboxBuilder()
+                .setCustomId('is_active')
+                .setDefault(Boolean(adv?.isActive))
+            )
+        );
       await interaction.showModal(modal);
       return;
     }
 
+    // 4.5 Lista de Encuentros (/encounters)
     if (id.startsWith('enclist_page_')) {
       const page = parseInt(id.split('_')[2], 10);
       const payload = await buildEncountersListPayload(interaction.guildId, page, t);
@@ -1254,6 +1383,7 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    // 4.6 Controles del Dashboard de Encuentro
     if (id.startsWith('enc_')) {
       const parts = id.split('_');
       const encounterId = parseInt(parts[parts.length - 1], 10);
@@ -1306,49 +1436,94 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.update({ content: `🗑️ ${t.encounterDeleted}`, embeds: [], components: [] });
         return;
       } else if (action === 'rename') {
-        const modal = new ModalBuilder().setCustomId(`modal_enc_rename_${encounterId}`).setTitle(t.renameEncounter);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('name').setLabel('Name').setStyle(TextInputStyle.Short).setValue(encounter.name).setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_enc_rename_${encounterId}`)
+          .setTitle(t.renameEncounter)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel('Name')
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('name')
+                  .setStyle(TextInputStyle.Short)
+                  .setMaxLength(100)
+                  .setValue(encounter.name)
+                  .setRequired(true)
+              )
+          );
         await interaction.showModal(modal);
         return;
       } else if (action === 'scene') {
-        const modal = new ModalBuilder().setCustomId(`modal_enc_scene_${encounterId}`).setTitle(t.editSceneAspects);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('scene_aspects').setLabel(t.sceneAspects).setStyle(TextInputStyle.Paragraph).setValue(encounter.sceneAspects || '').setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_enc_scene_${encounterId}`)
+          .setTitle(t.editSceneAspects)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.sceneAspects)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('scene_aspects')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(1000)
+                  .setValue(encounter.sceneAspects || '')
+                  .setRequired(false)
+              )
+          );
         await interaction.showModal(modal);
         return;
-      } else if (action === 'newchar') {
-        const modal = new ModalBuilder().setCustomId(`modal_enc_newchar_${encounterId}`).setTitle(t.addNewCharBtn);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('char_name').setLabel('Name').setStyle(TextInputStyle.Short).setRequired(false)
-          )
+      } else if (action === 'addchar') {
+        const allChars = await db.query.characters.findMany({
+          where: eq(characters.guildId, encounter.guildId)
+        });
+        const availableChars = allChars
+          .filter(c => c.adventureId === encounter.adventureId && !queue.some(q => q.characterId === c.id))
+          .slice(0, 25);
+
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_enc_addchar_${encounterId}`)
+          .setTitle(t.addCharBtn)
+          .addTextDisplayComponents(
+            new TextDisplayBuilder().setContent(t.addCharModalInstructions)
+          );
+
+        if (availableChars.length > 0) {
+          const selectExisting = new StringSelectMenuBuilder()
+            .setCustomId('existing_char')
+            .setPlaceholder(t.addExistingPlaceholder)
+            .setRequired(false)
+            .addOptions(
+              availableChars.map(c =>
+                new StringSelectMenuOptionBuilder()
+                  .setLabel(c.name)
+                  .setValue(String(c.id))
+              )
+            );
+
+          modal.addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.existingCharLabel)
+              .setStringSelectMenuComponent(selectExisting)
+          );
+        }
+
+        modal.addLabelComponents(
+          new LabelBuilder()
+            .setLabel(t.newCharLabel)
+            .setTextInputComponent(
+              new TextInputBuilder()
+                .setCustomId('new_char_name')
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(100)
+                .setRequired(false)
+            )
         );
+
         await interaction.showModal(modal);
         return;
       } else if (action === 'stress' && selectedIdx !== -1) {
         const targetCharId = queue[selectedIdx].characterId;
         const character = await db.query.characters.findFirst({ where: eq(characters.id, targetCharId) });
-        const phys = (character?.physicalStress as boolean[]) || [false, false, false, false];
-        const ment = (character?.mentalStress as boolean[]) || [false, false, false, false];
-        const physStr = phys.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
-        const mentStr = ment.map((v, i) => (v ? i + 1 : null)).filter(Boolean).join(',');
-
-        const modal = new ModalBuilder().setCustomId(`modal_enc_stress_${targetCharId}_${encounterId}`).setTitle(`${t.editStress}: ${character?.name}`);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('physical').setLabel(`${t.physicalStress} (1-4)`).setValue(physStr).setRequired(false).setStyle(TextInputStyle.Short)
-          ),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('mental').setLabel(`${t.mentalStress} (1-4)`).setValue(mentStr).setRequired(false).setStyle(TextInputStyle.Short)
-          )
-        );
+        const modal = buildStressModal(`modal_enc_stress_${targetCharId}_${encounterId}`, `${t.editStress}: ${character?.name}`, character, t);
         await interaction.showModal(modal);
         return;
       }
@@ -1360,6 +1535,7 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    // 4.7 Sistema de Notas (/notes) con StringSelect en Modal de creación y Paragraph maxLength
     if (id.startsWith('note_')) {
       const parts = id.split('_');
       const action = parts[1];
@@ -1375,18 +1551,47 @@ client.on('interactionCreate', async (interaction) => {
       if (action === 'createbtn') {
         const vis = parts[2];
         const page = parseInt(parts[3], 10);
-        const modal = new ModalBuilder().setCustomId(`modal_note_create_${vis}_${page}`).setTitle(t.createNoteBtn);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('title').setLabel(t.noteTitleLabel).setStyle(TextInputStyle.Short).setRequired(true)
-          ),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('visibility').setLabel('Visibility (private/public)').setStyle(TextInputStyle.Short).setValue('private').setRequired(true)
-          ),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('content').setLabel(t.noteContentLabel).setStyle(TextInputStyle.Paragraph).setRequired(false)
-          )
-        );
+
+        const visSelect = new StringSelectMenuBuilder()
+          .setCustomId('visibility')
+          .setRequired(true)
+          .addOptions(
+            new StringSelectMenuOptionBuilder()
+              .setLabel(t.publicLabel)
+              .setValue('public')
+              .setDefault(true),
+            new StringSelectMenuOptionBuilder()
+              .setLabel(t.privateLabel)
+              .setValue('private')
+              .setDefault(false)
+          );
+
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_note_create_${vis}_${page}`)
+          .setTitle(t.createNoteBtn)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.noteTitleLabel)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('title')
+                  .setStyle(TextInputStyle.Short)
+                  .setMaxLength(100)
+                  .setRequired(true)
+              ),
+            new LabelBuilder()
+              .setLabel(t.visibility)
+              .setStringSelectMenuComponent(visSelect),
+            new LabelBuilder()
+              .setLabel(t.noteContentLabel)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('content')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(2000)
+                  .setRequired(false)
+              )
+          );
         await interaction.showModal(modal);
         return;
       }
@@ -1412,24 +1617,44 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (action === 'edit') {
-        const modal = new ModalBuilder().setCustomId(`modal_note_${noteId}_${vis}_${page}`).setTitle(t.editNote);
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('title').setLabel('Title').setStyle(TextInputStyle.Short).setValue(note.title).setRequired(false)
-          ),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder().setCustomId('content').setLabel('Content').setStyle(TextInputStyle.Paragraph).setValue(note.content || '').setRequired(false)
-          )
-        );
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_note_${noteId}_${vis}_${page}`)
+          .setTitle(t.editNote)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.noteTitleLabel)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('title')
+                  .setStyle(TextInputStyle.Short)
+                  .setMaxLength(100)
+                  .setValue(note.title)
+                  .setRequired(true)
+              ),
+            new LabelBuilder()
+              .setLabel(t.noteContentLabel)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('content')
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setMaxLength(2000)
+                  .setValue(note.content || '')
+                  .setRequired(false)
+              )
+          );
         await interaction.showModal(modal);
         return;
       }
     }
   }
 
+  // ==========================================
+  // 5. MODAL SUBMISSIONS
+  // ==========================================
   if (interaction.isModalSubmit()) {
     const parts = interaction.customId.split('_');
 
+    // 5.1 Edición de Ficha (/sheet)
     if (parts[1] === 'sh') {
       const fieldType = parts[2];
       const charId = parseInt(parts[3], 10);
@@ -1470,10 +1695,10 @@ client.on('interactionCreate', async (interaction) => {
         const severe = interaction.fields.getTextInputValue('severe');
         await db.update(characters).set({ consequences: { mild, moderate, severe } }).where(eq(characters.id, charId));
       } else if (fieldType === 'stress') {
-        const physInput = interaction.fields.getTextInputValue('physical').split(',').map(s => parseInt(s.trim(), 10));
-        const mentInput = interaction.fields.getTextInputValue('mental').split(',').map(s => parseInt(s.trim(), 10));
-        const physical = [1, 2, 3, 4].map(n => physInput.includes(n));
-        const mental = [1, 2, 3, 4].map(n => mentInput.includes(n));
+        const physSelected = interaction.fields.getCheckboxGroup('physical') || [];
+        const mentSelected = interaction.fields.getCheckboxGroup('mental') || [];
+        const physical = [1, 2, 3, 4].map(n => physSelected.includes(String(n)));
+        const mental = [1, 2, 3, 4].map(n => mentSelected.includes(String(n)));
         await db.update(characters).set({ physicalStress: physical as any, mentalStress: mental as any }).where(eq(characters.id, charId));
       }
 
@@ -1490,18 +1715,24 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    // 5.2 Edición de Aventura (/adventure-info)
     if (parts[1] === 'adv') {
       const advId = parseInt(parts[2], 10);
       const name = interaction.fields.getTextInputValue('name');
       const description = interaction.fields.getTextInputValue('description');
-      const activeRaw = interaction.fields.getTextInputValue('is_active').toLowerCase().trim();
-      const isActive = activeRaw === 'true' || activeRaw === '1' || activeRaw === 'yes' || activeRaw === 'si';
+      const isActive = interaction.fields.getCheckbox('is_active');
+
+      // Si se marca como activa, desactivar cualquier otra aventura activa del servidor
+      if (isActive) {
+        await db.update(adventures).set({ isActive: false }).where(eq(adventures.guildId, interaction.guildId));
+      }
 
       await db.update(adventures).set({ name, description, isActive }).where(eq(adventures.id, advId));
       await interaction.reply({ content: '✅ Adventure updated.', ephemeral: true });
       return;
     }
 
+    // 5.3 Modales de Encuentro
     if (parts[1] === 'enc') {
       const subAction = parts[2];
 
@@ -1519,39 +1750,56 @@ client.on('interactionCreate', async (interaction) => {
         await db.update(encounters).set({ sceneAspects }).where(eq(encounters.id, encounterId));
         await refreshEncounterMessage(encounterId, t);
         await interaction.deferUpdate();
-      } else if (subAction === 'newchar') {
+      } else if (subAction === 'addchar') {
         const encounterId = parseInt(parts[3], 10);
-        const charName = interaction.fields.getTextInputValue('char_name').trim();
         const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
-        if (encounter && charName) {
-          let character = await db.query.characters.findFirst({
-            where: and(eq(characters.name, charName), eq(characters.guildId, interaction.guildId))
-          });
-          if (!character) {
-            const [created] = await db
-              .insert(characters)
-              .values({ guildId: interaction.guildId, adventureId: encounter.adventureId, name: charName })
-              .returning();
-            character = created;
+
+        if (encounter) {
+          let selectedExistingIds: readonly string[] = [];
+          try {
+            selectedExistingIds = interaction.fields.getStringSelectValues('existing_char');
+          } catch {}
+
+          const newCharName = interaction.fields.getTextInputValue('new_char_name').trim();
+          let charIdToAdd: number | null = null;
+
+          // Prioridad: si eligió existente del select, usamos ese; si no, creamos/buscamos el nuevo por nombre
+          if (selectedExistingIds.length > 0) {
+            charIdToAdd = parseInt(selectedExistingIds[0], 10);
+          } else if (newCharName) {
+            let character = await db.query.characters.findFirst({
+              where: and(eq(characters.name, newCharName), eq(characters.guildId, interaction.guildId))
+            });
+            if (!character) {
+              const [created] = await db
+                .insert(characters)
+                .values({ guildId: interaction.guildId, adventureId: encounter.adventureId, name: newCharName })
+                .returning();
+              character = created;
+            }
+            charIdToAdd = character.id;
           }
-          const queue = (encounter.turnQueue as QueueItem[]) || [];
-          if (!queue.some(q => q.characterId === character!.id)) {
-            queue.push({ characterId: character.id, ap: 0, maxAp: 3 });
+
+          if (charIdToAdd !== null) {
+            const queue = (encounter.turnQueue as QueueItem[]) || [];
+            if (!queue.some(q => q.characterId === charIdToAdd)) {
+              queue.push({ characterId: charIdToAdd, ap: 0, maxAp: 3 });
+            }
+            await db
+              .update(encounters)
+              .set({ turnQueue: queue as any, selectedCharId: encounter.selectedCharId || charIdToAdd })
+              .where(eq(encounters.id, encounterId));
+            await refreshEncounterMessage(encounterId, t);
           }
-          await db
-            .update(encounters)
-            .set({ turnQueue: queue as any, selectedCharId: encounter.selectedCharId || character.id })
-            .where(eq(encounters.id, encounterId));
-          await refreshEncounterMessage(encounterId, t);
         }
         await interaction.deferUpdate();
       } else if (subAction === 'stress') {
         const targetCharId = parseInt(parts[3], 10);
         const encounterId = parseInt(parts[4], 10);
-        const physInput = interaction.fields.getTextInputValue('physical').split(',').map(s => parseInt(s.trim(), 10));
-        const mentInput = interaction.fields.getTextInputValue('mental').split(',').map(s => parseInt(s.trim(), 10));
-        const physical = [1, 2, 3, 4].map(n => physInput.includes(n));
-        const mental = [1, 2, 3, 4].map(n => mentInput.includes(n));
+        const physSelected = interaction.fields.getCheckboxGroup('physical') || [];
+        const mentSelected = interaction.fields.getCheckboxGroup('mental') || [];
+        const physical = [1, 2, 3, 4].map(n => physSelected.includes(String(n)));
+        const mental = [1, 2, 3, 4].map(n => mentSelected.includes(String(n)));
 
         await db.update(characters).set({ physicalStress: physical as any, mentalStress: mental as any }).where(eq(characters.id, targetCharId));
         await refreshEncounterMessage(encounterId, t);
@@ -1560,14 +1808,15 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    // 5.4 Modales de Notas
     if (parts[1] === 'note') {
       if (parts[2] === 'create') {
         const vis = parts[3];
         const page = parseInt(parts[4], 10);
         const title = interaction.fields.getTextInputValue('title').trim();
-        const visInput = interaction.fields.getTextInputValue('visibility').toLowerCase().trim();
+        const visValues = interaction.fields.getStringSelectValues('visibility');
         const content = interaction.fields.getTextInputValue('content');
-        const isPublic = visInput === 'public' || visInput === 'publica';
+        const isPublic = (visValues[0] || 'public') === 'public';
 
         const activeAdventure = await db.query.adventures.findFirst({
           where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
