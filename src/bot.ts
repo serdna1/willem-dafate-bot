@@ -20,7 +20,7 @@ import {
   TextChannel
 } from 'discord.js';
 import { db } from './db/index.js';
-import { characters, adventures, encounters, notes } from './db/schema.js';
+import { characters, adventures, encounters, notes, guildConfigs } from './db/schema.js';
 import { eq, and, desc } from 'drizzle-orm';
 import { getTranslation } from './i18n.js';
 
@@ -32,6 +32,7 @@ const EMBED_COLOR = 0xFF1493;
 const SHEET_COLOR = 0xFFA500;
 const BATTLE_COLOR = 0xDC143C;
 const NOTE_COLOR = 0x00CED1;
+const CONFIG_COLOR = 0x5865F2;
 
 interface QueueItem {
   characterId: number;
@@ -39,31 +40,66 @@ interface QueueItem {
   maxAp: number;
 }
 
-interface PendingRollData {
+interface SingleRollEntry {
+  characterName?: string;
   results: string[];
   total: number;
   detail: string;
+}
+
+interface PendingRollData {
+  entries: SingleRollEntry[];
+  adventureName?: string;
   user: string;
 }
 
 const activeSheetInteractions = new Map<string, { interaction: any; page: number }>();
-
-// Almacén en memoria para tiradas ocultas/privadas (evita superar el límite de 100 caracteres del custom_id de Discord)
+const notesSearchState = new Map<string, string>(); // key: `${guildId}_${userId}` -> query
 const pendingRolls = new Map<string, PendingRollData>();
 
 function storePendingRoll(data: PendingRollData): string {
   const id = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
   pendingRolls.set(id, data);
-  // Limpieza automática tras 24 horas
   setTimeout(() => pendingRolls.delete(id), 24 * 60 * 60 * 1000);
   return id;
 }
 
 async function getGuildLanguage(guildId: string): Promise<string> {
-  const activeAdv = await db.query.adventures.findFirst({
+  const cfg = await db.query.guildConfigs.findFirst({
+    where: eq(guildConfigs.guildId, guildId)
+  });
+  return cfg?.language || 'english';
+}
+
+async function getActiveAdventure(guildId: string) {
+  return await db.query.adventures.findFirst({
     where: and(eq(adventures.guildId, guildId), eq(adventures.isActive, true))
   });
-  return activeAdv?.language || 'english';
+}
+
+function parseTags(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(/[\s,]+/)
+    .map(t => t.trim())
+    .filter(Boolean)
+    .map(t => (t.startsWith('#') ? t.toLowerCase() : `#${t.toLowerCase()}`));
+}
+
+function hasMainTag(tagsStr: string | null | undefined): boolean {
+  return parseTags(tagsStr).includes('#main');
+}
+
+function sortCharactersByMainAndRecent(chars: any[]) {
+  return [...chars].sort((a, b) => {
+    const aMain = hasMainTag(a.tags) ? 1 : 0;
+    const bMain = hasMainTag(b.tags) ? 1 : 0;
+    if (bMain !== aMain) return bMain - aMain;
+    const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+    const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+    if (timeB !== timeA) return timeB - timeA;
+    return b.id - a.id;
+  });
 }
 
 function rollDice(diceCount: number, modifier: number = 0) {
@@ -96,7 +132,79 @@ async function parseAndExecuteRoll(
   const mode = (match[2] || '').toLowerCase();
   if (mode === 's' && !allowPrivateS) return null;
 
-  const rest = (match[3] || match[4] || '').trim();
+  const activeAdv = await getActiveAdventure(guildId);
+  let rest = (match[3] || match[4] || '').trim();
+
+  // Detectar si hay un #hashtag al final o dentro de la expresión
+  const tagMatch = rest.match(/(?:^|\s)(#[a-zA-Z0-9_\-áéíóúÁÉÍÓÚñÑ]+)\s*$/);
+  const targetTag = tagMatch ? tagMatch[1].toLowerCase() : null;
+  if (targetTag && tagMatch) {
+    rest = rest.slice(0, tagMatch.index).trim();
+  }
+
+  // Caso A: Tirada masiva por #tag
+  if (targetTag) {
+    let guildChars = await db.query.characters.findMany({
+      where: eq(characters.guildId, guildId)
+    });
+    if (activeAdv) {
+      const advChars = guildChars.filter(c => c.adventureId === activeAdv.id);
+      if (advChars.length > 0) guildChars = advChars;
+    }
+
+    const taggedChars = sortCharactersByMainAndRecent(
+      guildChars.filter(c => parseTags(c.tags).includes(targetTag))
+    );
+
+    if (taggedChars.length === 0) {
+      return { error: 'TAG_NOT_FOUND' };
+    }
+
+    const entries: SingleRollEntry[] = [];
+    const numMatch = rest.match(/^([+-]?\d+)$/);
+
+    for (const char of taggedChars) {
+      let modifier = 0;
+      let detail = '';
+
+      if (numMatch) {
+        modifier = parseInt(numMatch[1], 10);
+        detail = `Mod: ${modifier >= 0 ? '+' : ''}${modifier}`;
+      } else if (rest) {
+        const skillQuery = rest.toLowerCase();
+        const skillsObj = (char.skills as Record<string, string[]>) || {};
+        let found = false;
+        for (const [modStr, skillList] of Object.entries(skillsObj)) {
+          const matchedSkill = skillList.find(s => s.toLowerCase() === skillQuery);
+          if (matchedSkill) {
+            modifier = parseInt(modStr, 10);
+            detail = `${matchedSkill} (${modifier >= 0 ? '+' : ''}${modifier})`;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          detail = `${rest} (+0)`;
+        }
+      }
+
+      const roll = rollDice(diceCount, modifier);
+      entries.push({
+        characterName: char.name,
+        results: roll.results,
+        total: roll.total,
+        detail
+      });
+    }
+
+    return {
+      mode,
+      entries,
+      adventureName: activeAdv?.name
+    };
+  }
+
+  // Caso B: Tirada individual estándar
   let modifier = 0;
   let labelDetail = '';
 
@@ -122,9 +230,20 @@ async function parseAndExecuteRoll(
 
       if (!character) {
         skillQuery = rest.toLowerCase();
-        character = await db.query.characters.findFirst({
-          where: and(eq(characters.discordUserId, userId), eq(characters.guildId, guildId))
-        });
+        if (activeAdv) {
+          character = await db.query.characters.findFirst({
+            where: and(
+              eq(characters.discordUserId, userId),
+              eq(characters.guildId, guildId),
+              eq(characters.adventureId, activeAdv.id)
+            )
+          });
+        }
+        if (!character) {
+          character = await db.query.characters.findFirst({
+            where: and(eq(characters.discordUserId, userId), eq(characters.guildId, guildId))
+          });
+        }
       }
 
       if (!character) {
@@ -153,15 +272,30 @@ async function parseAndExecuteRoll(
   const roll = rollDice(diceCount, modifier);
   return {
     mode,
-    results: roll.results,
-    total: roll.total,
-    labelDetail
+    entries: [{
+      results: roll.results,
+      total: roll.total,
+      detail: labelDetail
+    }],
+    adventureName: activeAdv?.name
   };
 }
 
-/**
- * Helper para construir el modal de estrés con CheckboxGroups (1, 2, 3, 4)
- */
+function formatRollEntriesText(entries: SingleRollEntry[]): string {
+  if (entries.length === 1 && !entries[0].characterName) {
+    const e = entries[0];
+    const detailText = e.detail ? ` (${e.detail})` : '';
+    return `[ ${e.results.join(' , ')} ]${detailText}\n**Total:** \`${e.total}\``;
+  }
+
+  return entries
+    .map(e => {
+      const detailText = e.detail ? ` (${e.detail})` : '';
+      return `**${e.characterName}:** [ ${e.results.join(' , ')} ]${detailText} → **Total:** \`${e.total}\``;
+    })
+    .join('\n');
+}
+
 function buildStressModal(customId: string, title: string, character: any, t: any) {
   const phys = (character?.physicalStress as boolean[]) || [false, false, false, false];
   const ment = (character?.mentalStress as boolean[]) || [false, false, false, false];
@@ -201,9 +335,33 @@ function buildStressModal(customId: string, title: string, character: any, t: an
     );
 }
 
-function buildSheetPagePayload(character: any, page: number, t: any) {
+function buildConfirmDeleteModal(customId: string, itemName: string, t: any) {
+  return new ModalBuilder()
+    .setCustomId(customId)
+    .setTitle(t.confirmDeleteTitle)
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`${t.confirmDeleteDesc} **${itemName}**?`)
+    )
+    .addLabelComponents(
+      new LabelBuilder()
+        .setLabel(t.confirmCheckboxLabel)
+        .setCheckboxComponent(
+          new CheckboxBuilder()
+            .setCustomId('confirm_check')
+            .setDefault(false)
+        )
+    );
+}
+
+async function buildSheetPagePayload(character: any, viewerUserId: string, page: number, t: any) {
   const totalPages = 7;
   const safePage = ((page % totalPages) + totalPages) % totalPages;
+
+  let adventureName = 'N/A';
+  if (character.adventureId) {
+    const adv = await db.query.adventures.findFirst({ where: eq(adventures.id, character.adventureId) });
+    if (adv) adventureName = adv.name;
+  }
 
   const pageTitles = [
     t.description,
@@ -215,27 +373,41 @@ function buildSheetPagePayload(character: any, page: number, t: any) {
     t.stress
   ];
 
+  const formattedTags = character.tags && character.tags.trim() !== '' ? character.tags.trim() : '_None_';
+
   const embed = new EmbedBuilder()
     .setColor(SHEET_COLOR)
     .setTitle(`✦ ${t.character.toUpperCase()}: ${character.name.toUpperCase()} ✦`)
-    .setDescription(`**${t.refresh}:** \`${character.refresh ?? 3}\`  |  **${pageTitles[safePage]}**`)
+    .setDescription(
+      `📖 **${t.adventure}:** ${adventureName}\n` +
+      `**${t.refresh}:** \`${character.refresh ?? 3}\`  |  **${t.tags}:** ${formattedTags}\n` +
+      `**${pageTitles[safePage]}**`
+    )
     .setFooter({ text: `${t.page} ${safePage + 1}/${totalPages}` });
+
+  const isLinkedToViewer = character.discordUserId === viewerUserId;
 
   const headerRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`sh_edit_name_${character.id}_${safePage}`).setLabel(t.editName).setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`sh_edit_refresh_${character.id}_${safePage}`).setLabel(t.editRefresh).setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`sh_edit_refresh_${character.id}_${safePage}`).setLabel(t.editRefresh).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`sh_edit_tags_${character.id}_${safePage}`).setLabel(t.editTags).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`sh_link_${character.id}_${safePage}`)
+      .setLabel(isLinkedToViewer ? t.unlinkCharacter : t.linkCharacter)
+      .setStyle(isLinkedToViewer ? ButtonStyle.Danger : ButtonStyle.Primary)
   );
 
+  const editPageRow = new ActionRowBuilder<ButtonBuilder>();
   const skillRows: ActionRowBuilder<ButtonBuilder>[] = [];
 
   if (safePage === 0) {
     embed.addFields({ name: t.description, value: character.description || 'N/A' });
-    headerRow.addComponents(
+    editPageRow.addComponents(
       new ButtonBuilder().setCustomId(`sh_edit_desc_${character.id}_${safePage}`).setLabel(t.editDescription).setStyle(ButtonStyle.Secondary)
     );
   } else if (safePage === 1) {
     embed.addFields({ name: t.aspects, value: character.aspects && character.aspects.trim() !== '' ? character.aspects : 'None' });
-    headerRow.addComponents(
+    editPageRow.addComponents(
       new ButtonBuilder().setCustomId(`sh_edit_aspects_${character.id}_${safePage}`).setLabel(t.editAspects).setStyle(ButtonStyle.Secondary)
     );
   } else if (safePage === 2) {
@@ -248,7 +420,7 @@ function buildSheetPagePayload(character: any, page: number, t: any) {
       }
     }
     embed.addFields({ name: t.skills, value: lines.join('\n') || 'None' });
-    headerRow.addComponents(
+    editPageRow.addComponents(
       new ButtonBuilder().setCustomId(`sh_edit_skills_${character.id}_${safePage}`).setLabel(t.editSkills).setStyle(ButtonStyle.Secondary)
     );
 
@@ -256,7 +428,7 @@ function buildSheetPagePayload(character: any, page: number, t: any) {
     let count = 0;
     for (const mod of sortedMods) {
       for (const skill of skillsObj[mod]) {
-        if (skillRows.length >= 3) break;
+        if (skillRows.length >= 2) break;
         if (count >= 5) {
           skillRows.push(currentRow);
           currentRow = new ActionRowBuilder<ButtonBuilder>();
@@ -271,17 +443,17 @@ function buildSheetPagePayload(character: any, page: number, t: any) {
         count++;
       }
     }
-    if (count > 0 && skillRows.length < 3) {
+    if (count > 0 && skillRows.length < 2) {
       skillRows.push(currentRow);
     }
   } else if (safePage === 3) {
     embed.addFields({ name: t.stunts, value: character.stunts && character.stunts.trim() !== '' ? character.stunts : 'None' });
-    headerRow.addComponents(
+    editPageRow.addComponents(
       new ButtonBuilder().setCustomId(`sh_edit_stunts_${character.id}_${safePage}`).setLabel(t.editStunts).setStyle(ButtonStyle.Secondary)
     );
   } else if (safePage === 4) {
     embed.addFields({ name: t.extras, value: character.extras && character.extras.trim() !== '' ? character.extras : 'None' });
-    headerRow.addComponents(
+    editPageRow.addComponents(
       new ButtonBuilder().setCustomId(`sh_edit_extras_${character.id}_${safePage}`).setLabel(t.editExtras).setStyle(ButtonStyle.Secondary)
     );
   } else if (safePage === 5) {
@@ -291,7 +463,7 @@ function buildSheetPagePayload(character: any, page: number, t: any) {
       { name: t.moderate, value: cons.moderate || 'None' },
       { name: t.severe, value: cons.severe || 'None' }
     );
-    headerRow.addComponents(
+    editPageRow.addComponents(
       new ButtonBuilder().setCustomId(`sh_edit_cons_${character.id}_${safePage}`).setLabel(t.editConsequences).setStyle(ButtonStyle.Secondary)
     );
   } else if (safePage === 6) {
@@ -303,7 +475,7 @@ function buildSheetPagePayload(character: any, page: number, t: any) {
       { name: t.physicalStress, value: renderBoxes(phys), inline: true },
       { name: t.mentalStress, value: renderBoxes(ment), inline: true }
     );
-    headerRow.addComponents(
+    editPageRow.addComponents(
       new ButtonBuilder().setCustomId(`sh_edit_stress_${character.id}_${safePage}`).setLabel(t.editStress).setStyle(ButtonStyle.Secondary)
     );
   }
@@ -313,7 +485,176 @@ function buildSheetPagePayload(character: any, page: number, t: any) {
     new ButtonBuilder().setCustomId(`sh_page_${character.id}_${safePage + 1}`).setLabel(t.nextPage).setStyle(ButtonStyle.Primary)
   );
 
-  return { embeds: [embed], components: [headerRow, ...skillRows, navRow] };
+  return { embeds: [embed], components: [headerRow, editPageRow, ...skillRows, navRow] };
+}
+
+async function buildAdventuresPagePayload(guildId: string, page: number, t: any) {
+  const allAdvs = await db.query.adventures.findMany({
+    where: eq(adventures.guildId, guildId),
+    orderBy: [desc(adventures.isActive), desc(adventures.createdAt), desc(adventures.id)]
+  });
+
+  if (allAdvs.length === 0) {
+    const embed = new EmbedBuilder()
+      .setColor(EMBED_COLOR)
+      .setTitle(`📖 ${t.adventuresTitle}`)
+      .setDescription(`_${t.noAdventures}_`);
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId('adv_create_0')
+        .setLabel(`➕ ${t.createAdventure}`)
+        .setStyle(ButtonStyle.Success)
+    );
+    return { embeds: [embed], components: [row] };
+  }
+
+  const totalPages = allAdvs.length;
+  const safePage = ((page % totalPages) + totalPages) % totalPages;
+  const adv = allAdvs[safePage];
+
+  const advChars = await db.query.characters.findMany({
+    where: and(eq(characters.guildId, guildId), eq(characters.adventureId, adv.id))
+  });
+  const sortedChars = sortCharactersByMainAndRecent(advChars).slice(0, 10);
+  const charsDisplay = sortedChars.length > 0
+    ? sortedChars.map(c => `• **${c.name}** ${c.tags ? `(${c.tags})` : ''}`).join('\n')
+    : '_None_';
+
+  const embed = new EmbedBuilder()
+    .setColor(EMBED_COLOR)
+    .setTitle(`📖 ${t.adventure}: ${adv.name}`)
+    .addFields(
+      { name: t.description, value: adv.description || 'N/A' },
+      { name: t.status, value: adv.isActive ? `🟢 ${t.active}` : `⚪ ${t.inactive}`, inline: true },
+      { name: `${t.characters} (Top 10)`, value: charsDisplay }
+    )
+    .setFooter({ text: `${t.page} ${safePage + 1}/${totalPages}` });
+
+  const actionRow1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`adv_edit_${adv.id}_${safePage}`)
+      .setLabel(`✏️ ${t.editAdventure}`)
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`adv_activate_${adv.id}_${safePage}`)
+      .setLabel(`⚡ ${t.activateAdventure}`)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(adv.isActive),
+    new ButtonBuilder()
+      .setCustomId(`adv_chars_${adv.id}`)
+      .setLabel(`👥 ${t.showCharacters}`)
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`adv_del_${adv.id}_${safePage}`)
+      .setLabel(`🗑️ ${t.deleteAdventure}`)
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  const navRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`adv_page_${safePage - 1}`)
+      .setLabel(t.prevPage)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(totalPages <= 1),
+    new ButtonBuilder()
+      .setCustomId(`adv_create_${safePage}`)
+      .setLabel(`➕ ${t.createAdventure}`)
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`adv_page_${safePage + 1}`)
+      .setLabel(t.nextPage)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(totalPages <= 1)
+  );
+
+  return { embeds: [embed], components: [actionRow1, navRow] };
+}
+
+async function buildCharactersListPayload(guildId: string, adventureId: number | null, page: number, t: any) {
+  let targetAdv = adventureId
+    ? await db.query.adventures.findFirst({ where: eq(adventures.id, adventureId) })
+    : await getActiveAdventure(guildId);
+
+  if (!targetAdv) {
+    const embed = new EmbedBuilder()
+      .setColor(SHEET_COLOR)
+      .setTitle(`👥 ${t.characters}`)
+      .setDescription(`_${t.noActiveAdventure}_`);
+    return { embeds: [embed], components: [] };
+  }
+
+  const rawChars = await db.query.characters.findMany({
+    where: and(eq(characters.guildId, guildId), eq(characters.adventureId, targetAdv.id))
+  });
+  const sorted = sortCharactersByMainAndRecent(rawChars);
+
+  const pageSize = 10;
+  const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
+  const safePage = Math.max(0, Math.min(totalPages - 1, page));
+  const slice = sorted.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  const embed = new EmbedBuilder()
+    .setColor(SHEET_COLOR)
+    .setTitle(`👥 ${t.charactersOf} ${targetAdv.name}`)
+    .setDescription(
+      slice.length > 0
+        ? slice.map((c, i) => `**${safePage * pageSize + i + 1}. ${c.name}** ${c.tags ? `— \`${c.tags}\`` : ''}`).join('\n')
+        : `_${t.noCharacters}_`
+    )
+    .setFooter({ text: `${t.page} ${safePage + 1}/${totalPages}` });
+
+  const components: ActionRowBuilder<ButtonBuilder>[] = [];
+
+  // Botones de ficha (máx 5 por fila -> hasta 2 filas para los 10 personajes)
+  for (let i = 0; i < slice.length; i += 5) {
+    const chunk = slice.slice(i, i + 5);
+    const sheetRow = new ActionRowBuilder<ButtonBuilder>();
+    chunk.forEach(c => {
+      sheetRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`charlist_sheet_${c.id}`)
+          .setLabel(`📄 ${c.name.slice(0, 15)}`)
+          .setStyle(ButtonStyle.Secondary)
+      );
+    });
+    components.push(sheetRow);
+  }
+
+  // Botones de borrar (hasta 2 filas para los 10 personajes)
+  for (let i = 0; i < slice.length; i += 5) {
+    const chunk = slice.slice(i, i + 5);
+    const delRow = new ActionRowBuilder<ButtonBuilder>();
+    chunk.forEach(c => {
+      delRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`charlist_del_${c.id}_${targetAdv!.id}_${safePage}`)
+          .setLabel(`🗑️ ${c.name.slice(0, 15)}`)
+          .setStyle(ButtonStyle.Danger)
+      );
+    });
+    components.push(delRow);
+  }
+
+  const navRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`charlist_page_${targetAdv.id}_${safePage - 1}`)
+      .setLabel(t.prevPage)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(safePage === 0),
+    new ButtonBuilder()
+      .setCustomId(`charlist_create_${targetAdv.id}_${safePage}`)
+      .setLabel(`➕ ${t.newCharacter}`)
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`charlist_page_${targetAdv.id}_${safePage + 1}`)
+      .setLabel(t.nextPage)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(safePage >= totalPages - 1)
+  );
+  components.push(navRow);
+
+  return { embeds: [embed], components };
 }
 
 async function buildEncounterDashboard(encounter: any, t: any) {
@@ -323,6 +664,12 @@ async function buildEncounterDashboard(encounter: any, t: any) {
   });
   const charMap = new Map(allChars.map(c => [c.id, c]));
 
+  let adventureName = 'N/A';
+  if (encounter.adventureId) {
+    const adv = await db.query.adventures.findFirst({ where: eq(adventures.id, encounter.adventureId) });
+    if (adv) adventureName = adv.name;
+  }
+
   const renderStress = (arr: boolean[]) => (arr || [false, false, false, false]).map(v => (v ? '■' : '□')).join('');
   const renderAP = (ap: number, maxAp: number) => {
     const safeMax = Math.max(1, maxAp || 3);
@@ -330,7 +677,7 @@ async function buildEncounterDashboard(encounter: any, t: any) {
     return '🔴'.repeat(clamped) + '⚪'.repeat(safeMax - clamped);
   };
 
-  const descriptionLines: string[] = [];
+  const descriptionLines: string[] = [`📖 **${t.adventure}:** ${adventureName}`];
 
   if (encounter.sceneAspects && encounter.sceneAspects.trim() !== '') {
     descriptionLines.push(`🌍 **${t.sceneAspects}:**\n> ${encounter.sceneAspects.replace(/\n/g, '\n> ')}\n`);
@@ -403,13 +750,13 @@ async function buildEncounterDashboard(encounter: any, t: any) {
       new ButtonBuilder().setCustomId(`enc_maxap_add_${encounter.id}`).setLabel(`+1 ${t.maxAp}`).setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`enc_maxap_sub_${encounter.id}`).setLabel(`-1 ${t.maxAp}`).setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`enc_addchar_${encounter.id}`).setLabel(`➕ ${t.addCharBtn}`).setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(`enc_delete_${encounter.id}`).setLabel(`🗑️ ${t.deleteEncounter}`).setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId(`enc_bump_${encounter.id}`).setLabel(`⬇️ ${t.bumpMessage}`).setStyle(ButtonStyle.Secondary)
     );
     components.push(row4);
   } else {
     const rowEmpty = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`enc_addchar_${encounter.id}`).setLabel(`➕ ${t.addCharBtn}`).setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(`enc_delete_${encounter.id}`).setLabel(`🗑️ ${t.deleteEncounter}`).setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId(`enc_bump_${encounter.id}`).setLabel(`⬇️ ${t.bumpMessage}`).setStyle(ButtonStyle.Secondary)
     );
     components.push(rowEmpty);
   }
@@ -434,6 +781,7 @@ async function refreshEncounterMessage(encounterId: number, t: any) {
 }
 
 async function buildEncountersListPayload(guildId: string, page: number, t: any) {
+  const activeAdv = await getActiveAdventure(guildId);
   const allEncounters = await db.query.encounters.findMany({
     where: eq(encounters.guildId, guildId),
     orderBy: [desc(encounters.createdAt), desc(encounters.id)]
@@ -448,9 +796,10 @@ async function buildEncountersListPayload(guildId: string, page: number, t: any)
     .setColor(BATTLE_COLOR)
     .setTitle(`⚔️ ${t.encountersList}`)
     .setDescription(
-      slice.length > 0
+      `📖 **${t.adventure}:** ${activeAdv ? activeAdv.name : 'N/A'}\n\n` +
+      (slice.length > 0
         ? slice.map((e, i) => `**${safePage * pageSize + i + 1}.** ${e.name}`).join('\n')
-        : '_No encounters created yet._'
+        : '_No encounters created yet._')
     )
     .setFooter({ text: `${t.page} ${safePage + 1}/${totalPages}` });
 
@@ -458,15 +807,22 @@ async function buildEncountersListPayload(guildId: string, page: number, t: any)
 
   if (slice.length > 0) {
     const openRow = new ActionRowBuilder<ButtonBuilder>();
+    const delRow = new ActionRowBuilder<ButtonBuilder>();
     slice.forEach(enc => {
       openRow.addComponents(
         new ButtonBuilder()
           .setCustomId(`enclist_open_${enc.id}`)
-          .setLabel(enc.name.slice(0, 20))
+          .setLabel(`⚔️ ${enc.name.slice(0, 16)}`)
           .setStyle(ButtonStyle.Secondary)
       );
+      delRow.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`enclist_del_${enc.id}_${safePage}`)
+          .setLabel(`🗑️ ${enc.name.slice(0, 16)}`)
+          .setStyle(ButtonStyle.Danger)
+      );
     });
-    components.push(openRow);
+    components.push(openRow, delRow);
   }
 
   const navRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -475,6 +831,10 @@ async function buildEncountersListPayload(guildId: string, page: number, t: any)
       .setLabel(t.prevPage)
       .setStyle(ButtonStyle.Primary)
       .setDisabled(safePage === 0),
+    new ButtonBuilder()
+      .setCustomId(`enclist_create_${safePage}`)
+      .setLabel(`➕ ${t.newEncounter}`)
+      .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`enclist_page_${safePage + 1}`)
       .setLabel(t.nextPage)
@@ -487,16 +847,32 @@ async function buildEncountersListPayload(guildId: string, page: number, t: any)
 }
 
 async function buildNotesListPayload(guildId: string, userId: string, visibilityFilter: string, page: number, t: any) {
+  const activeAdv = await getActiveAdventure(guildId);
+  const searchQuery = (notesSearchState.get(`${guildId}_${userId}`) || '').trim().toLowerCase();
+
   const allNotes = await db.query.notes.findMany({
     where: eq(notes.guildId, guildId),
     orderBy: [desc(notes.isPinned), desc(notes.createdAt), desc(notes.id)]
   });
 
   const filtered = allNotes.filter(n => {
+    // Filtro visibilidad
+    let visMatch = false;
     if (visibilityFilter === 'private') {
-      return !n.isPublic && n.authorId === userId;
+      visMatch = !n.isPublic && n.authorId === userId;
+    } else if (visibilityFilter === 'public') {
+      visMatch = n.isPublic === true;
+    } else {
+      // 'all'
+      visMatch = n.isPublic === true || n.authorId === userId;
     }
-    return n.isPublic === true || n.authorId === userId;
+    if (!visMatch) return false;
+
+    // Filtro búsqueda por título (subcadena)
+    if (searchQuery && !n.title.toLowerCase().includes(searchQuery)) {
+      return false;
+    }
+    return true;
   });
 
   const pageSize = 5;
@@ -504,13 +880,24 @@ async function buildNotesListPayload(guildId: string, userId: string, visibility
   const safePage = Math.max(0, Math.min(totalPages - 1, page));
   const slice = filtered.slice(safePage * pageSize, (safePage + 1) * pageSize);
 
+  const filterTitle =
+    visibilityFilter === 'private'
+      ? t.filterPrivate
+      : visibilityFilter === 'public'
+      ? t.filterPublic
+      : t.filterAll;
+
   const embed = new EmbedBuilder()
     .setColor(NOTE_COLOR)
-    .setTitle(`📝 ${t.notesTitle} (${visibilityFilter === 'private' ? t.privateLabel : 'Public & Mine'})`)
+    .setTitle(`📝 ${t.notesTitle} — ${filterTitle}`)
+    .setDescription(
+      `📖 **${t.adventure}:** ${activeAdv ? activeAdv.name : 'N/A'}` +
+      (searchQuery ? `  |  🔍 \`${searchQuery}\`` : '')
+    )
     .setFooter({ text: `${t.page} ${safePage + 1}/${totalPages}` });
 
   if (slice.length === 0) {
-    embed.setDescription(`_${t.noNotes}_`);
+    embed.addFields({ name: '\u200B', value: `_${t.noNotes}_` });
   } else {
     for (const n of slice) {
       const pinIcon = n.isPinned ? '📌 ' : '';
@@ -542,7 +929,7 @@ async function buildNotesListPayload(guildId: string, userId: string, visibility
   if (slice.length > 0) {
     const editRow = new ActionRowBuilder<ButtonBuilder>();
     const pinRow = new ActionRowBuilder<ButtonBuilder>();
-    const visRow = new ActionRowBuilder<ButtonBuilder>();
+    const delRow = new ActionRowBuilder<ButtonBuilder>();
 
     slice.forEach(n => {
       const shortTitle = n.title.slice(0, 14);
@@ -558,31 +945,58 @@ async function buildNotesListPayload(guildId: string, userId: string, visibility
           .setLabel(`📌 ${shortTitle}`)
           .setStyle(ButtonStyle.Secondary)
       );
-      visRow.addComponents(
+      delRow.addComponents(
         new ButtonBuilder()
-          .setCustomId(`note_vis_${n.id}_${visibilityFilter}_${safePage}`)
-          .setLabel(`👁️ ${shortTitle}`)
-          .setStyle(ButtonStyle.Secondary)
+          .setCustomId(`note_del_${n.id}_${visibilityFilter}_${safePage}`)
+          .setLabel(`🗑️ ${shortTitle}`)
+          .setStyle(ButtonStyle.Danger)
       );
     });
 
-    components.push(editRow, pinRow, visRow);
+    components.push(editRow, pinRow, delRow);
   }
 
-  const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+  // Fila de filtros de visibilidad + buscador
+  const filterRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setCustomId(`note_createbtn_${visibilityFilter}_${safePage}`)
-      .setLabel(`➕ ${t.createNoteBtn}`)
-      .setStyle(ButtonStyle.Success)
+      .setCustomId(`note_filter_all`)
+      .setLabel(t.filterAll)
+      .setStyle(visibilityFilter === 'all' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`note_filter_public`)
+      .setLabel(t.filterPublic)
+      .setStyle(visibilityFilter === 'public' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`note_filter_private`)
+      .setLabel(t.filterPrivate)
+      .setStyle(visibilityFilter === 'private' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`note_search_${visibilityFilter}`)
+      .setLabel(`🔍 ${t.searchBtn}`)
+      .setStyle(ButtonStyle.Secondary)
   );
-  components.push(actionRow);
 
+  if (searchQuery) {
+    filterRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`note_clearsearch_${visibilityFilter}`)
+        .setLabel(`✖️ ${t.clearSearchBtn}`)
+        .setStyle(ButtonStyle.Danger)
+    );
+  }
+  components.push(filterRow);
+
+  // Fila de navegación y creación
   const navRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`note_page_${visibilityFilter}_${safePage - 1}`)
       .setLabel(t.prevPage)
       .setStyle(ButtonStyle.Primary)
       .setDisabled(safePage === 0),
+    new ButtonBuilder()
+      .setCustomId(`note_createbtn_${visibilityFilter}_${safePage}`)
+      .setLabel(`➕ ${t.createNoteBtn}`)
+      .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`note_page_${visibilityFilter}_${safePage + 1}`)
       .setLabel(t.nextPage)
@@ -594,18 +1008,37 @@ async function buildNotesListPayload(guildId: string, userId: string, visibility
   return { embeds: [embed], components };
 }
 
+async function buildConfigPayload(guildId: string, t: any) {
+  const currentLang = await getGuildLanguage(guildId);
+  const langDisplay = currentLang === 'spanish' ? 'Español' : 'English';
+
+  const embed = new EmbedBuilder()
+    .setColor(CONFIG_COLOR)
+    .setTitle(`⚙️ ${t.configTitle}`)
+    .addFields({ name: t.languageLabel, value: langDisplay, inline: true });
+
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId('cfg_edit_lang')
+      .setLabel(`🌐 ${t.editLanguageBtn}`)
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
 
   await readyClient.application.commands.set([
     {
       name: 'roll',
-      description: 'Roll Fate dice (supports 4df, 4dfs, 4dfss, modifiers, skills and character names)',
+      description: 'Roll Fate dice (supports 4df, 4dfs, 4dfss, modifiers, skills, character names and #tags)',
       options: [
         {
           name: 'expression',
           type: ApplicationCommandOptionType.String,
-          description: 'e.g. 4df, 4dfs +2, 4dfs empathy Antonio',
+          description: 'e.g. 4df, 4dfs +2, 4dfs empathy Antonio, 4dfs perception #pj',
           required: true
         }
       ]
@@ -618,101 +1051,30 @@ client.once(Events.ClientReady, async (readyClient) => {
           name: 'name',
           type: ApplicationCommandOptionType.String,
           description: 'Character name',
-          required: false
+          required: false,
+          autocomplete: true
         }
       ]
     },
     {
-      name: 'change_language',
-      description: 'Change bot language',
-      options: [
-        {
-          name: 'language',
-          type: ApplicationCommandOptionType.String,
-          description: 'Choose language',
-          required: true,
-          choices: [
-            { name: 'English', value: 'english' },
-            { name: 'Spanish', value: 'spanish' }
-          ]
-        }
-      ]
+      name: 'adventures',
+      description: 'Manage adventures (create, edit, activate, delete, view characters)'
     },
     {
-      name: 'adventure-create',
-      description: 'Create a new Fate adventure',
-      options: [
-        { name: 'name', type: ApplicationCommandOptionType.String, description: 'Adventure name', required: true },
-        { name: 'description', type: ApplicationCommandOptionType.String, description: 'Adventure description', required: false }
-      ]
-    },
-    {
-      name: 'adventure-start',
-      description: 'Set an adventure as active',
-      options: [{ name: 'name', type: ApplicationCommandOptionType.String, description: 'Adventure name', required: true }]
-    },
-    {
-      name: 'adventure-end',
-      description: 'Clear the active adventure'
-    },
-    {
-      name: 'adventure-info',
-      description: 'Show active adventure details and edit options'
-    },
-    {
-      name: 'character-create',
-      description: 'Create a new character in the active adventure',
-      options: [{ name: 'name', type: ApplicationCommandOptionType.String, description: 'Character name', required: true }]
-    },
-    {
-      name: 'character-link',
-      description: 'Link yourself to a character and get its role',
-      options: [{ name: 'name', type: ApplicationCommandOptionType.String, description: 'Character name', required: true }]
-    },
-    {
-      name: 'encounter-create',
-      description: 'Create a new encounter',
-      options: [
-        { name: 'name', type: ApplicationCommandOptionType.String, description: 'Encounter name', required: true },
-        { name: 'scene_aspects', type: ApplicationCommandOptionType.String, description: 'Initial scene aspects', required: false }
-      ]
+      name: 'characters',
+      description: 'List and manage characters of the active adventure'
     },
     {
       name: 'encounters',
-      description: 'List all encounters with pagination'
-    },
-    {
-      name: 'note-create',
-      description: 'Create a new note',
-      options: [
-        { name: 'title', type: ApplicationCommandOptionType.String, description: 'Note title', required: true },
-        {
-          name: 'visibility',
-          type: ApplicationCommandOptionType.String,
-          description: 'Visibility (default: private)',
-          required: false,
-          choices: [
-            { name: 'Private', value: 'private' },
-            { name: 'Public', value: 'public' }
-          ]
-        }
-      ]
+      description: 'List, create and manage encounters'
     },
     {
       name: 'notes',
-      description: 'View notes list',
-      options: [
-        {
-          name: 'visibility',
-          type: ApplicationCommandOptionType.String,
-          description: 'Filter notes',
-          required: false,
-          choices: [
-            { name: 'Public', value: 'public' },
-            { name: 'Private', value: 'private' }
-          ]
-        }
-      ]
+      description: 'View, search, create and manage notes'
+    },
+    {
+      name: 'config',
+      description: 'Configure server settings (language, etc.)'
     },
     {
       name: 'View Character Sheet',
@@ -734,18 +1096,23 @@ client.on(Events.MessageCreate, async (message) => {
   if (!rollOutcome) return;
 
   if ('error' in rollOutcome) {
-    const errorMsg = rollOutcome.error === 'CHAR_NOT_FOUND' ? t.charNotFound : t.skillNotFound;
+    const errorMsg =
+      rollOutcome.error === 'CHAR_NOT_FOUND'
+        ? t.charNotFound
+        : rollOutcome.error === 'TAG_NOT_FOUND'
+        ? t.tagNotFound
+        : t.skillNotFound;
     await message.reply({ content: errorMsg });
     return;
   }
 
-  const detailText = rollOutcome.labelDetail ? ` (${rollOutcome.labelDetail})` : '';
+  const advSuffix = rollOutcome.adventureName ? ` — ${rollOutcome.adventureName}` : '';
+  const bodyText = formatRollEntriesText(rollOutcome.entries);
 
   if (rollOutcome.mode === 'ss') {
     const rollId = storePendingRoll({
-      results: rollOutcome.results,
-      total: rollOutcome.total,
-      detail: detailText,
+      entries: rollOutcome.entries,
+      adventureName: rollOutcome.adventureName,
       user: message.author.username
     });
 
@@ -757,7 +1124,7 @@ client.on(Events.MessageCreate, async (message) => {
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(revealBtn);
     await message.delete().catch(() => {});
     await message.channel.send({
-      content: `🎲 **${message.author.username}** ${t.hiddenRoll}`,
+      content: `🎲 **${message.author.username}** ${t.hiddenRoll}${advSuffix}`,
       components: [row]
     });
     return;
@@ -765,8 +1132,8 @@ client.on(Events.MessageCreate, async (message) => {
 
   const embed = new EmbedBuilder()
     .setColor(EMBED_COLOR)
-    .setTitle(t.diceRollResult)
-    .setDescription(`[ ${rollOutcome.results.join(' , ')} ]${detailText}\n\n**Total:** \`${rollOutcome.total}\``);
+    .setTitle(`${t.diceRollResult}${advSuffix}`)
+    .setDescription(bodyText);
 
   await message.reply({ embeds: [embed] });
 });
@@ -775,6 +1142,37 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.guildId) return;
   const lang = await getGuildLanguage(interaction.guildId);
   const t = getTranslation(lang);
+
+  // ==========================================
+  // 0. AUTOCOMPLETE (/sheet name)
+  // ==========================================
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName === 'sheet') {
+      const focused = interaction.options.getFocused().toLowerCase();
+      const activeAdv = await getActiveAdventure(interaction.guildId);
+
+      let guildChars = await db.query.characters.findMany({
+        where: eq(characters.guildId, interaction.guildId)
+      });
+
+      if (activeAdv) {
+        const advChars = guildChars.filter(c => c.adventureId === activeAdv.id);
+        if (advChars.length > 0) guildChars = advChars;
+      }
+
+      const sorted = sortCharactersByMainAndRecent(guildChars)
+        .filter(c => c.name.toLowerCase().includes(focused))
+        .slice(0, 5);
+
+      await interaction.respond(
+        sorted.map(c => ({
+          name: c.tags ? `${c.name} (${c.tags})`.slice(0, 100) : c.name.slice(0, 100),
+          value: c.name
+        }))
+      );
+    }
+    return;
+  }
 
   // ==========================================
   // 1. SLASH COMMANDS
@@ -792,18 +1190,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if ('error' in rollOutcome) {
-        const errorMsg = rollOutcome.error === 'CHAR_NOT_FOUND' ? t.charNotFound : t.skillNotFound;
+        const errorMsg =
+          rollOutcome.error === 'CHAR_NOT_FOUND'
+            ? t.charNotFound
+            : rollOutcome.error === 'TAG_NOT_FOUND'
+            ? t.tagNotFound
+            : t.skillNotFound;
         await interaction.reply({ content: errorMsg, ephemeral: true });
         return;
       }
 
-      const detailText = rollOutcome.labelDetail ? ` (${rollOutcome.labelDetail})` : '';
+      const advSuffix = rollOutcome.adventureName ? ` — ${rollOutcome.adventureName}` : '';
+      const bodyText = formatRollEntriesText(rollOutcome.entries);
 
       if (rollOutcome.mode === 's') {
         const rollId = storePendingRoll({
-          results: rollOutcome.results,
-          total: rollOutcome.total,
-          detail: detailText,
+          entries: rollOutcome.entries,
+          adventureName: rollOutcome.adventureName,
           user: interaction.user.username
         });
 
@@ -815,7 +1218,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(revealBtn);
 
         await interaction.reply({
-          content: `${t.privateRollHeader}\n[ ${rollOutcome.results.join(' , ')} ]${detailText}\n\n**Total:** \`${rollOutcome.total}\``,
+          content: `${t.privateRollHeader}${advSuffix}\n${bodyText}`,
           components: [row],
           ephemeral: true
         });
@@ -824,9 +1227,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (rollOutcome.mode === 'ss') {
         const rollId = storePendingRoll({
-          results: rollOutcome.results,
-          total: rollOutcome.total,
-          detail: detailText,
+          entries: rollOutcome.entries,
+          adventureName: rollOutcome.adventureName,
           user: interaction.user.username
         });
 
@@ -838,7 +1240,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(revealBtn);
 
         await interaction.reply({
-          content: `🎲 **${interaction.user.username}** ${t.hiddenRoll}`,
+          content: `🎲 **${interaction.user.username}** ${t.hiddenRoll}${advSuffix}`,
           components: [row]
         });
         return;
@@ -846,159 +1248,56 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const embed = new EmbedBuilder()
         .setColor(EMBED_COLOR)
-        .setTitle(t.diceRollResult)
-        .setDescription(`[ ${rollOutcome.results.join(' , ')} ]${detailText}\n\n**Total:** \`${rollOutcome.total}\``);
+        .setTitle(`${t.diceRollResult}${advSuffix}`)
+        .setDescription(bodyText);
 
       await interaction.reply({ embeds: [embed] });
     }
 
     if (commandName === 'sheet') {
       const charName = interaction.options.getString('name');
-      const character = charName
-        ? await db.query.characters.findFirst({
-            where: and(eq(characters.name, charName), eq(characters.guildId, interaction.guildId))
-          })
-        : await db.query.characters.findFirst({
+      const activeAdv = await getActiveAdventure(interaction.guildId);
+
+      let character = null;
+      if (charName) {
+        character = await db.query.characters.findFirst({
+          where: and(eq(characters.name, charName), eq(characters.guildId, interaction.guildId))
+        });
+      } else {
+        if (activeAdv) {
+          character = await db.query.characters.findFirst({
+            where: and(
+              eq(characters.discordUserId, interaction.user.id),
+              eq(characters.guildId, interaction.guildId),
+              eq(characters.adventureId, activeAdv.id)
+            )
+          });
+        }
+        if (!character) {
+          character = await db.query.characters.findFirst({
             where: and(eq(characters.discordUserId, interaction.user.id), eq(characters.guildId, interaction.guildId))
           });
+        }
+      }
 
       if (!character) {
         await interaction.reply({ content: t.charNotFound, ephemeral: true });
         return;
       }
 
-      const payload = buildSheetPagePayload(character, 0, t);
+      const payload = await buildSheetPagePayload(character, interaction.user.id, 0, t);
       await interaction.reply({ ...payload, ephemeral: true });
       activeSheetInteractions.set(`${interaction.user.id}_${character.id}`, { interaction, page: 0 });
     }
 
-    if (commandName === 'change_language') {
-      const selectedLang = interaction.options.getString('language', true);
-      await db
-        .update(adventures)
-        .set({ language: selectedLang })
-        .where(and(eq(adventures.guildId, interaction.guildId), eq(adventures.isActive, true)));
-      const newT = getTranslation(selectedLang);
-      await interaction.reply({ content: newT.langChanged, ephemeral: true });
+    if (commandName === 'adventures') {
+      const payload = await buildAdventuresPagePayload(interaction.guildId, 0, t);
+      await interaction.reply({ ...payload, ephemeral: true });
     }
 
-    if (commandName === 'adventure-create') {
-      const name = interaction.options.getString('name', true);
-      const description = interaction.options.getString('description');
-      await db.insert(adventures).values({ guildId: interaction.guildId, name, description, language: 'english' });
-      const embed = new EmbedBuilder().setColor(EMBED_COLOR).setDescription(`Adventure **${name}** created.`);
-      await interaction.reply({ embeds: [embed] });
-    }
-
-    if (commandName === 'adventure-start') {
-      const name = interaction.options.getString('name', true);
-      const adventure = await db.query.adventures.findFirst({
-        where: and(eq(adventures.name, name), eq(adventures.guildId, interaction.guildId))
-      });
-      if (!adventure) {
-        await interaction.reply({ content: 'Adventure not found.', ephemeral: true });
-        return;
-      }
-      await db.update(adventures).set({ isActive: false }).where(eq(adventures.guildId, interaction.guildId));
-      await db.update(adventures).set({ isActive: true }).where(eq(adventures.id, adventure.id));
-      const embed = new EmbedBuilder().setColor(EMBED_COLOR).setDescription(`Adventure **${name}** is now active.`);
-      await interaction.reply({ embeds: [embed] });
-    }
-
-    if (commandName === 'adventure-end') {
-      await db.update(adventures).set({ isActive: false }).where(eq(adventures.guildId, interaction.guildId));
-      const embed = new EmbedBuilder().setColor(EMBED_COLOR).setDescription(`Active adventure cleared.`);
-      await interaction.reply({ embeds: [embed] });
-    }
-
-    if (commandName === 'adventure-info') {
-      const activeAdventure = await db.query.adventures.findFirst({
-        where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
-      });
-      if (!activeAdventure) {
-        await interaction.reply({ content: t.noActiveAdventure, ephemeral: true });
-        return;
-      }
-      const chars = await db.query.characters.findMany({
-        where: and(eq(characters.adventureId, activeAdventure.id), eq(characters.guildId, interaction.guildId))
-      });
-      const charNames = chars.map(c => c.name).join(', ') || 'None';
-
-      const editAdvBtn = new ButtonBuilder()
-        .setCustomId(`edit_adv_${activeAdventure.id}`)
-        .setLabel(t.editAdventure)
-        .setStyle(ButtonStyle.Secondary);
-
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(editAdvBtn);
-
-      const embed = new EmbedBuilder()
-        .setColor(EMBED_COLOR)
-        .setTitle(`Adventure: ${activeAdventure.name}`)
-        .addFields(
-          { name: t.description, value: activeAdventure.description || 'N/A' },
-          { name: t.status, value: activeAdventure.isActive ? t.active : t.inactive, inline: true },
-          { name: t.characters, value: charNames }
-        );
-      await interaction.reply({ embeds: [embed], components: [row] });
-    }
-
-    if (commandName === 'character-create') {
-      const name = interaction.options.getString('name', true);
-      const activeAdventure = await db.query.adventures.findFirst({
-        where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
-      });
-      if (!activeAdventure) {
-        await interaction.reply({ content: t.noActiveAdventure, ephemeral: true });
-        return;
-      }
-      await db.insert(characters).values({ guildId: interaction.guildId, adventureId: activeAdventure.id, name });
-      const embed = new EmbedBuilder().setColor(EMBED_COLOR).setDescription(`Character **${name}** created.`);
-      await interaction.reply({ embeds: [embed] });
-    }
-
-    if (commandName === 'character-link') {
-      const name = interaction.options.getString('name', true);
-      const character = await db.query.characters.findFirst({
-        where: and(eq(characters.name, name), eq(characters.guildId, interaction.guildId))
-      });
-      if (!character) {
-        await interaction.reply({ content: t.charNotFound, ephemeral: true });
-        return;
-      }
-      await db.update(characters).set({ discordUserId: interaction.user.id }).where(eq(characters.id, character.id));
-      const guild = interaction.guild!;
-      let role = guild.roles.cache.find(r => r.name === character.name);
-      if (!role) {
-        role = await guild.roles.create({ name: character.name });
-      }
-      const member = await guild.members.fetch(interaction.user.id);
-      await member.roles.add(role);
-      const embed = new EmbedBuilder().setColor(EMBED_COLOR).setDescription(`Linked to **${character.name}**.`);
-      await interaction.reply({ embeds: [embed] });
-    }
-
-    if (commandName === 'encounter-create') {
-      const name = interaction.options.getString('name', true);
-      const sceneAspects = interaction.options.getString('scene_aspects') || '';
-      const activeAdventure = await db.query.adventures.findFirst({
-        where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
-      });
-
-      const [newEncounter] = await db
-        .insert(encounters)
-        .values({
-          guildId: interaction.guildId,
-          adventureId: activeAdventure?.id || null,
-          name,
-          sceneAspects,
-          channelId: interaction.channelId,
-          turnQueue: []
-        })
-        .returning();
-
-      const payload = await buildEncounterDashboard(newEncounter, t);
-      const replyMsg = await interaction.reply({ ...payload, fetchReply: true });
-      await db.update(encounters).set({ messageId: replyMsg.id }).where(eq(encounters.id, newEncounter.id));
+    if (commandName === 'characters') {
+      const payload = await buildCharactersListPayload(interaction.guildId, null, 0, t);
+      await interaction.reply({ ...payload, ephemeral: true });
     }
 
     if (commandName === 'encounters') {
@@ -1006,30 +1305,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply({ ...payload, ephemeral: true });
     }
 
-    if (commandName === 'note-create') {
-      const title = interaction.options.getString('title', true);
-      const visibility = interaction.options.getString('visibility') || 'private';
-      const isPublic = visibility === 'public';
-
-      const activeAdventure = await db.query.adventures.findFirst({
-        where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
-      });
-
-      await db.insert(notes).values({
-        guildId: interaction.guildId,
-        adventureId: activeAdventure?.id || null,
-        authorId: interaction.user.id,
-        title,
-        isPublic
-      });
-
-      await interaction.reply({ content: `✅ **${title}** (${isPublic ? t.publicLabel : t.privateLabel}) - ${t.noteCreated}`, ephemeral: true });
+    if (commandName === 'notes') {
+      const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, 'all', 0, t);
+      await interaction.reply({ ...payload, ephemeral: true });
     }
 
-    if (commandName === 'notes') {
-      const visibility = interaction.options.getString('visibility') || 'public';
-      const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, visibility, 0, t);
-      await interaction.reply({ ...payload, ephemeral: visibility === 'private' });
+    if (commandName === 'config') {
+      const payload = await buildConfigPayload(interaction.guildId, t);
+      await interaction.reply({ ...payload, ephemeral: true });
     }
   }
 
@@ -1037,14 +1320,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // 2. USER CONTEXT MENU
   // ==========================================
   if (interaction.isUserContextMenuCommand() && interaction.commandName === 'View Character Sheet') {
-    const character = await db.query.characters.findFirst({
-      where: and(eq(characters.discordUserId, interaction.targetId), eq(characters.guildId, interaction.guildId))
-    });
+    const activeAdv = await getActiveAdventure(interaction.guildId);
+    let character = activeAdv
+      ? await db.query.characters.findFirst({
+          where: and(
+            eq(characters.discordUserId, interaction.targetId),
+            eq(characters.guildId, interaction.guildId),
+            eq(characters.adventureId, activeAdv.id)
+          )
+        })
+      : null;
+
+    if (!character) {
+      character = await db.query.characters.findFirst({
+        where: and(eq(characters.discordUserId, interaction.targetId), eq(characters.guildId, interaction.guildId))
+      });
+    }
+
     if (!character) {
       await interaction.reply({ content: t.charNotFound, ephemeral: true });
       return;
     }
-    const payload = buildSheetPagePayload(character, 0, t);
+    const payload = await buildSheetPagePayload(character, interaction.user.id, 0, t);
     await interaction.reply({ ...payload, ephemeral: true });
     activeSheetInteractions.set(`${interaction.user.id}_${character.id}`, { interaction, page: 0 });
   }
@@ -1072,7 +1369,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isButton()) {
     const id = interaction.customId;
 
-    // 4.1 Revelar tiradas (usando ID corto de pendingRolls)
+    // 4.1 Revelar tiradas
     if (id.startsWith('reveal_ss_')) {
       const rollId = id.replace('reveal_ss_', '');
       const data = pendingRolls.get(rollId);
@@ -1081,8 +1378,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       pendingRolls.delete(rollId);
+      const advSuffix = data.adventureName ? ` — ${data.adventureName}` : '';
       await interaction.update({
-        content: `🎲 **${data.user}** ${t.revealedRoll}:\n[ ${data.results.join(' , ')} ]${data.detail}\n\n**Total:** \`${data.total}\``,
+        content: `🎲 **${data.user}** ${t.revealedRoll}${advSuffix}:\n${formatRollEntriesText(data.entries)}`,
         components: []
       });
       return;
@@ -1096,23 +1394,242 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       pendingRolls.delete(rollId);
+      const advSuffix = data.adventureName ? ` — ${data.adventureName}` : '';
       await interaction.update({
         content: `✅ Shared with channel.`,
         components: []
       });
       await interaction.followUp({
-        content: `🎲 **${data.user}** ${t.revealedRoll}:\n[ ${data.results.join(' , ')} ]${data.detail}\n\n**Total:** \`${data.total}\``,
+        content: `🎲 **${data.user}** ${t.revealedRoll}${advSuffix}:\n${formatRollEntriesText(data.entries)}`,
         ephemeral: false
       });
       return;
     }
 
-    // 4.2 Tirada de habilidad desde ficha
+    // 4.2 Config (/config)
+    if (id === 'cfg_edit_lang') {
+      const currentLang = await getGuildLanguage(interaction.guildId);
+      const langSelect = new StringSelectMenuBuilder()
+        .setCustomId('language')
+        .setRequired(true)
+        .addOptions(
+          new StringSelectMenuOptionBuilder()
+            .setLabel('English')
+            .setValue('english')
+            .setDefault(currentLang === 'english'),
+          new StringSelectMenuOptionBuilder()
+            .setLabel('Español')
+            .setValue('spanish')
+            .setDefault(currentLang === 'spanish')
+        );
+
+      const modal = new ModalBuilder()
+        .setCustomId('modal_cfg_lang')
+        .setTitle(t.editLanguageBtn)
+        .addLabelComponents(
+          new LabelBuilder()
+            .setLabel(t.languageLabel)
+            .setStringSelectMenuComponent(langSelect)
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    // 4.3 Gestión de Aventuras (/adventures)
+    if (id.startsWith('adv_page_')) {
+      const page = parseInt(id.split('_')[2], 10);
+      const payload = await buildAdventuresPagePayload(interaction.guildId, page, t);
+      await interaction.update(payload);
+      return;
+    }
+
+    if (id.startsWith('adv_create_')) {
+      const page = parseInt(id.split('_')[2], 10);
+      const modal = new ModalBuilder()
+        .setCustomId(`modal_advcreate_${page}`)
+        .setTitle(t.createAdventure)
+        .addLabelComponents(
+          new LabelBuilder()
+            .setLabel('Name')
+            .setTextInputComponent(
+              new TextInputBuilder()
+                .setCustomId('name')
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(100)
+                .setRequired(true)
+            ),
+          new LabelBuilder()
+            .setLabel(t.description)
+            .setTextInputComponent(
+              new TextInputBuilder()
+                .setCustomId('description')
+                .setStyle(TextInputStyle.Paragraph)
+                .setMaxLength(4000)
+                .setRequired(false)
+            ),
+          new LabelBuilder()
+            .setLabel(t.activateLabel)
+            .setCheckboxComponent(
+              new CheckboxBuilder()
+                .setCustomId('is_active')
+                .setDefault(true)
+            )
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id.startsWith('adv_edit_')) {
+      const parts = id.split('_');
+      const advId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+      const adv = await db.query.adventures.findFirst({ where: eq(adventures.id, advId) });
+
+      const modal = new ModalBuilder()
+        .setCustomId(`modal_advedit_${advId}_${page}`)
+        .setTitle(t.editAdventure)
+        .addLabelComponents(
+          new LabelBuilder()
+            .setLabel('Name')
+            .setTextInputComponent(
+              new TextInputBuilder()
+                .setCustomId('name')
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(100)
+                .setValue(adv?.name || '')
+                .setRequired(true)
+            ),
+          new LabelBuilder()
+            .setLabel(t.description)
+            .setTextInputComponent(
+              new TextInputBuilder()
+                .setCustomId('description')
+                .setStyle(TextInputStyle.Paragraph)
+                .setMaxLength(4000)
+                .setValue(adv?.description || '')
+                .setRequired(false)
+            ),
+          new LabelBuilder()
+            .setLabel(t.activateLabel)
+            .setCheckboxComponent(
+              new CheckboxBuilder()
+                .setCustomId('is_active')
+                .setDefault(Boolean(adv?.isActive))
+            )
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id.startsWith('adv_activate_')) {
+      const parts = id.split('_');
+      const advId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+      await db.update(adventures).set({ isActive: false }).where(eq(adventures.guildId, interaction.guildId));
+      await db.update(adventures).set({ isActive: true }).where(eq(adventures.id, advId));
+      const payload = await buildAdventuresPagePayload(interaction.guildId, page, t);
+      await interaction.update(payload);
+      return;
+    }
+
+    if (id.startsWith('adv_del_')) {
+      const parts = id.split('_');
+      const advId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+      const adv = await db.query.adventures.findFirst({ where: eq(adventures.id, advId) });
+      if (!adv) return;
+
+      const modal = buildConfirmDeleteModal(`modal_advdel_${advId}_${page}`, adv.name, t);
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id.startsWith('adv_chars_')) {
+      const advId = parseInt(id.split('_')[2], 10);
+      const payload = await buildCharactersListPayload(interaction.guildId, advId, 0, t);
+      await interaction.reply({ ...payload, ephemeral: true });
+      return;
+    }
+
+    // 4.4 Gestión de Personajes (/characters)
+    if (id.startsWith('charlist_page_')) {
+      const parts = id.split('_');
+      const advId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+      const payload = await buildCharactersListPayload(interaction.guildId, advId, page, t);
+      await interaction.update(payload);
+      return;
+    }
+
+    if (id.startsWith('charlist_create_')) {
+      const parts = id.split('_');
+      const advId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+
+      const modal = new ModalBuilder()
+        .setCustomId(`modal_charcreate_${advId}_${page}`)
+        .setTitle(t.newCharacter)
+        .addLabelComponents(
+          new LabelBuilder()
+            .setLabel('Name')
+            .setTextInputComponent(
+              new TextInputBuilder()
+                .setCustomId('name')
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(100)
+                .setRequired(true)
+            ),
+          new LabelBuilder()
+            .setLabel(t.tags)
+            .setTextInputComponent(
+              new TextInputBuilder()
+                .setCustomId('tags')
+                .setPlaceholder('#main #human #funny')
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(200)
+                .setRequired(false)
+            )
+        );
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (id.startsWith('charlist_sheet_')) {
+      const charId = parseInt(id.split('_')[2], 10);
+      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
+      if (!character) return;
+
+      const payload = await buildSheetPagePayload(character, interaction.user.id, 0, t);
+      await interaction.reply({ ...payload, ephemeral: true });
+      activeSheetInteractions.set(`${interaction.user.id}_${character.id}`, { interaction, page: 0 });
+      return;
+    }
+
+    if (id.startsWith('charlist_del_')) {
+      const parts = id.split('_');
+      const charId = parseInt(parts[2], 10);
+      const advId = parseInt(parts[3], 10);
+      const page = parseInt(parts[4], 10);
+      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
+      if (!character) return;
+
+      const modal = buildConfirmDeleteModal(`modal_chardel_${charId}_${advId}_${page}`, character.name, t);
+      await interaction.showModal(modal);
+      return;
+    }
+
+    // 4.5 Tirada de habilidad desde ficha
     if (id.startsWith('skill_roll_')) {
       const [, , charIdStr, skillName] = id.split('_');
       const charId = parseInt(charIdStr, 10);
       const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
       if (!character || !character.skills) return;
+
+      let advSuffix = '';
+      if (character.adventureId) {
+        const adv = await db.query.adventures.findFirst({ where: eq(adventures.id, character.adventureId) });
+        if (adv) advSuffix = ` — ${adv.name}`;
+      }
 
       let modifier = 0;
       const skillsObj = character.skills as Record<string, string[]>;
@@ -1125,13 +1642,86 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const roll = rollDice(4, modifier);
       const embed = new EmbedBuilder()
         .setColor(EMBED_COLOR)
-        .setTitle(`${character.name} — ${t.skills}: ${skillName}`)
-        .setDescription(`[ ${roll.results.join(' , ')} ] (Mod: ${modifier >= 0 ? '+' : ''}${modifier})\n\n**Total:** \`${roll.total}\``);
+        .setTitle(`${character.name} — ${t.skills}: ${skillName}${advSuffix}`)
+        .setDescription(`[ ${roll.results.join(' , ')} ] (Mod: ${modifier >= 0 ? '+' : ''}${modifier})\n**Total:** \`${roll.total}\``);
       await interaction.reply({ embeds: [embed] });
       return;
     }
 
-    // 4.3 Paginación y Edición de Ficha (/sheet) con LabelBuilder y nuevos componentes de Modal
+    // 4.6 Paginación, Link y Edición de Ficha (/sheet)
+    if (id.startsWith('sh_link_')) {
+      const [, , charIdStr, pageStr] = id.split('_');
+      const charId = parseInt(charIdStr, 10);
+      const page = parseInt(pageStr, 10);
+      const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
+      if (!character) return;
+
+      // Caso 1: Ya está linkeado al propio usuario -> Desvincular
+      if (character.discordUserId === interaction.user.id) {
+        await db.update(characters).set({ discordUserId: null }).where(eq(characters.id, charId));
+        const guild = interaction.guild!;
+        const role = guild.roles.cache.find(r => r.name === character.name);
+        if (role) {
+          const member = await guild.members.fetch(interaction.user.id);
+          await member.roles.remove(role).catch(() => {});
+        }
+        const updatedChar = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
+        const payload = await buildSheetPagePayload(updatedChar, interaction.user.id, page, t);
+        await interaction.update(payload);
+        return;
+      }
+
+      // Caso 2: Ya está linkeado a OTRO usuario -> Error con el nombre de ese usuario
+      if (character.discordUserId && character.discordUserId !== interaction.user.id) {
+        let ownerName = character.discordUserId;
+        try {
+          const ownerUser = await client.users.fetch(character.discordUserId);
+          if (ownerUser) ownerName = ownerUser.username;
+        } catch {}
+        await interaction.reply({
+          content: `❌ ${t.charAlreadyLinked} **${ownerName}**.`,
+          ephemeral: true
+        });
+        return;
+      }
+
+      // Caso 3: Libre -> Desvincular cualquier otro personaje del usuario en la misma aventura y vincular este
+      if (character.adventureId) {
+        const previousLinked = await db.query.characters.findMany({
+          where: and(
+            eq(characters.guildId, interaction.guildId),
+            eq(characters.adventureId, character.adventureId),
+            eq(characters.discordUserId, interaction.user.id)
+          )
+        });
+
+        for (const prev of previousLinked) {
+          await db.update(characters).set({ discordUserId: null }).where(eq(characters.id, prev.id));
+          const oldRole = interaction.guild!.roles.cache.find(r => r.name === prev.name);
+          if (oldRole) {
+            const member = await interaction.guild!.members.fetch(interaction.user.id);
+            await member.roles.remove(oldRole).catch(() => {});
+          }
+        }
+      }
+
+      await db.update(characters).set({ discordUserId: interaction.user.id }).where(eq(characters.id, charId));
+      const guild = interaction.guild!;
+      let role = guild.roles.cache.find(r => r.name === character.name);
+      if (!role) {
+        role = await guild.roles.create({ name: character.name }).catch(() => undefined);
+      }
+      if (role) {
+        const member = await guild.members.fetch(interaction.user.id);
+        await member.roles.add(role).catch(() => {});
+      }
+
+      const updatedChar = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
+      const payload = await buildSheetPagePayload(updatedChar, interaction.user.id, page, t);
+      await interaction.update(payload);
+      return;
+    }
+
     if (id.startsWith('sh_page_')) {
       const [, , charIdStr, pageStr] = id.split('_');
       const charId = parseInt(charIdStr, 10);
@@ -1139,7 +1729,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const character = await db.query.characters.findFirst({ where: eq(characters.id, charId) });
       if (!character) return;
 
-      const payload = buildSheetPagePayload(character, page, t);
+      const payload = await buildSheetPagePayload(character, interaction.user.id, page, t);
       await interaction.update(payload);
       activeSheetInteractions.set(`${interaction.user.id}_${charId}`, { interaction, page });
       return;
@@ -1189,6 +1779,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
               )
           );
         await interaction.showModal(modal);
+      } else if (fieldType === 'tags') {
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_sh_tags_${charId}_${page}`)
+          .setTitle(t.editTags)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.tags)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('value')
+                  .setPlaceholder('#main #pj #human')
+                  .setStyle(TextInputStyle.Short)
+                  .setMaxLength(200)
+                  .setValue(character.tags || '')
+                  .setRequired(false)
+              )
+          );
+        await interaction.showModal(modal);
       } else if (fieldType === 'desc') {
         const modal = new ModalBuilder()
           .setCustomId(`modal_sh_desc_${charId}_${page}`)
@@ -1200,7 +1808,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 new TextInputBuilder()
                   .setCustomId('value')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(1000)
+                  .setMaxLength(4000)
                   .setValue(character.description || '')
                   .setRequired(false)
               )
@@ -1217,7 +1825,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 new TextInputBuilder()
                   .setCustomId('value')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(1000)
+                  .setMaxLength(4000)
                   .setValue(character.aspects || '')
                   .setRequired(false)
               )
@@ -1238,7 +1846,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   .setCustomId('value')
                   .setPlaceholder('+4: Shoot, Athletics\n+3: Empathy')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(1000)
+                  .setMaxLength(4000)
                   .setValue(lines.join('\n'))
                   .setRequired(false)
               )
@@ -1255,7 +1863,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 new TextInputBuilder()
                   .setCustomId('value')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(1500)
+                  .setMaxLength(4000)
                   .setValue(character.stunts || '')
                   .setRequired(false)
               )
@@ -1272,7 +1880,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 new TextInputBuilder()
                   .setCustomId('value')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(1500)
+                  .setMaxLength(4000)
                   .setValue(character.extras || '')
                   .setRequired(false)
               )
@@ -1290,7 +1898,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 new TextInputBuilder()
                   .setCustomId('mild')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(500)
+                  .setMaxLength(1500)
                   .setValue(cons.mild || '')
                   .setRequired(false)
               ),
@@ -1300,7 +1908,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 new TextInputBuilder()
                   .setCustomId('moderate')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(500)
+                  .setMaxLength(1500)
                   .setValue(cons.moderate || '')
                   .setRequired(false)
               ),
@@ -1310,7 +1918,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 new TextInputBuilder()
                   .setCustomId('severe')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(500)
+                  .setMaxLength(1500)
                   .setValue(cons.severe || '')
                   .setRequired(false)
               )
@@ -1323,14 +1931,46 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // 4.4 Editar Aventura (/adventure-info) con CheckboxBuilder
-    if (id.startsWith('edit_adv_')) {
-      const advId = parseInt(id.split('_')[2], 10);
-      const adv = await db.query.adventures.findFirst({ where: eq(adventures.id, advId) });
+    // 4.7 Lista de Encuentros (/encounters)
+    if (id.startsWith('enc_bump_')) {
+      const encounterId = parseInt(id.split('_')[2], 10);
+      const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
+      if (!encounter) return;
 
+      const payload = await buildEncounterDashboard(encounter, t);
+      await interaction.deferUpdate();
+
+      try {
+        if (encounter.channelId && encounter.messageId) {
+          const oldChannel = (await client.channels.fetch(encounter.channelId)) as TextChannel;
+          const oldMsg = await oldChannel?.messages.fetch(encounter.messageId);
+          await oldMsg?.delete();
+        }
+      } catch {}
+
+      const channel = interaction.channel as TextChannel;
+      if (channel) {
+        const newMsg = await channel.send(payload);
+        await db
+          .update(encounters)
+          .set({ channelId: channel.id, messageId: newMsg.id })
+          .where(eq(encounters.id, encounterId));
+      }
+      return;
+    }
+
+    if (id.startsWith('enclist_page_')) {
+      const page = parseInt(id.split('_')[2], 10);
+      const payload = await buildEncountersListPayload(interaction.guildId, page, t);
+      await interaction.update(payload);
+      return;
+    }
+
+    if (id.startsWith('enclist_create_')) {
+      const page = parseInt(id.split('_')[2], 10);
       const modal = new ModalBuilder()
-        .setCustomId(`modal_adv_${advId}`)
-        .setTitle(t.editAdventure)
+        .setCustomId(`modal_enccreate_${page}`)
+        .setTitle(t.newEncounter)
         .addLabelComponents(
           new LabelBuilder()
             .setLabel('Name')
@@ -1339,36 +1979,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 .setCustomId('name')
                 .setStyle(TextInputStyle.Short)
                 .setMaxLength(100)
-                .setValue(adv?.name || '')
                 .setRequired(true)
-            ),
-          new LabelBuilder()
-            .setLabel(t.description)
-            .setTextInputComponent(
-              new TextInputBuilder()
-                .setCustomId('description')
-                .setStyle(TextInputStyle.Paragraph)
-                .setMaxLength(1000)
-                .setValue(adv?.description || '')
-                .setRequired(false)
-            ),
-          new LabelBuilder()
-            .setLabel(t.activateLabel)
-            .setCheckboxComponent(
-              new CheckboxBuilder()
-                .setCustomId('is_active')
-                .setDefault(Boolean(adv?.isActive))
             )
         );
       await interaction.showModal(modal);
       return;
     }
 
-    // 4.5 Lista de Encuentros (/encounters)
-    if (id.startsWith('enclist_page_')) {
-      const page = parseInt(id.split('_')[2], 10);
-      const payload = await buildEncountersListPayload(interaction.guildId, page, t);
-      await interaction.update(payload);
+    if (id.startsWith('enclist_del_')) {
+      const parts = id.split('_');
+      const encounterId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+      const encounter = await db.query.encounters.findFirst({ where: eq(encounters.id, encounterId) });
+      if (!encounter) return;
+
+      const modal = buildConfirmDeleteModal(`modal_encdel_${encounterId}_${page}`, encounter.name, t);
+      await interaction.showModal(modal);
       return;
     }
 
@@ -1383,7 +2009,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // 4.6 Controles del Dashboard de Encuentro
+    // 4.8 Controles del Dashboard de Encuentro
     if (id.startsWith('enc_')) {
       const parts = id.split('_');
       const encounterId = parseInt(parts[parts.length - 1], 10);
@@ -1431,10 +2057,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
       } else if (action === 'delchar' && selectedIdx !== -1) {
         queue.splice(selectedIdx, 1);
-      } else if (action === 'delete') {
-        await db.delete(encounters).where(eq(encounters.id, encounterId));
-        await interaction.update({ content: `🗑️ ${t.encounterDeleted}`, embeds: [], components: [] });
-        return;
       } else if (action === 'rename') {
         const modal = new ModalBuilder()
           .setCustomId(`modal_enc_rename_${encounterId}`)
@@ -1464,7 +2086,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 new TextInputBuilder()
                   .setCustomId('scene_aspects')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(1000)
+                  .setMaxLength(4000)
                   .setValue(encounter.sceneAspects || '')
                   .setRequired(false)
               )
@@ -1475,9 +2097,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const allChars = await db.query.characters.findMany({
           where: eq(characters.guildId, encounter.guildId)
         });
-        const availableChars = allChars
-          .filter(c => c.adventureId === encounter.adventureId && !queue.some(q => q.characterId === c.id))
-          .slice(0, 25);
+        const availableChars = sortCharactersByMainAndRecent(
+          allChars.filter(c => c.adventureId === encounter.adventureId && !queue.some(q => q.characterId === c.id))
+        ).slice(0, 25);
 
         const modal = new ModalBuilder()
           .setCustomId(`modal_enc_addchar_${encounterId}`)
@@ -1535,10 +2157,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // 4.7 Sistema de Notas (/notes) con StringSelect en Modal de creación y Paragraph maxLength
+    // 4.9 Sistema de Notas (/notes)
     if (id.startsWith('note_')) {
       const parts = id.split('_');
       const action = parts[1];
+
+      if (action === 'filter') {
+        const newVis = parts[2];
+        const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, newVis, 0, t);
+        await interaction.update(payload);
+        return;
+      }
+
+      if (action === 'search') {
+        const vis = parts[2];
+        const currentQuery = notesSearchState.get(`${interaction.guildId}_${interaction.user.id}`) || '';
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_notesearch_${vis}`)
+          .setTitle(t.searchBtn)
+          .addLabelComponents(
+            new LabelBuilder()
+              .setLabel(t.searchQueryLabel)
+              .setTextInputComponent(
+                new TextInputBuilder()
+                  .setCustomId('query')
+                  .setStyle(TextInputStyle.Short)
+                  .setMaxLength(100)
+                  .setValue(currentQuery)
+                  .setRequired(false)
+              )
+          );
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (action === 'clearsearch') {
+        const vis = parts[2];
+        notesSearchState.delete(`${interaction.guildId}_${interaction.user.id}`);
+        const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, 0, t);
+        await interaction.update(payload);
+        return;
+      }
 
       if (action === 'page') {
         const vis = parts[2];
@@ -1588,7 +2247,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 new TextInputBuilder()
                   .setCustomId('content')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(2000)
+                  .setMaxLength(4000)
                   .setRequired(false)
               )
           );
@@ -1609,14 +2268,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      if (action === 'vis') {
-        await db.update(notes).set({ isPublic: !note.isPublic }).where(eq(notes.id, noteId));
-        const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, page, t);
-        await interaction.update(payload);
+      if (action === 'del') {
+        const modal = buildConfirmDeleteModal(`modal_notedel_${noteId}_${vis}_${page}`, note.title, t);
+        await interaction.showModal(modal);
         return;
       }
 
       if (action === 'edit') {
+        const visSelect = new StringSelectMenuBuilder()
+          .setCustomId('visibility')
+          .setRequired(true)
+          .addOptions(
+            new StringSelectMenuOptionBuilder()
+              .setLabel(t.publicLabel)
+              .setValue('public')
+              .setDefault(note.isPublic),
+            new StringSelectMenuOptionBuilder()
+              .setLabel(t.privateLabel)
+              .setValue('private')
+              .setDefault(!note.isPublic)
+          );
+
         const modal = new ModalBuilder()
           .setCustomId(`modal_note_${noteId}_${vis}_${page}`)
           .setTitle(t.editNote)
@@ -1632,12 +2304,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
                   .setRequired(true)
               ),
             new LabelBuilder()
+              .setLabel(t.visibility)
+              .setStringSelectMenuComponent(visSelect),
+            new LabelBuilder()
               .setLabel(t.noteContentLabel)
               .setTextInputComponent(
                 new TextInputBuilder()
                   .setCustomId('content')
                   .setStyle(TextInputStyle.Paragraph)
-                  .setMaxLength(2000)
+                  .setMaxLength(4000)
                   .setValue(note.content || '')
                   .setRequired(false)
               )
@@ -1654,7 +2329,121 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isModalSubmit()) {
     const parts = interaction.customId.split('_');
 
-    // 5.1 Edición de Ficha (/sheet)
+    // 5.0 Config
+    if (parts[1] === 'cfg' && parts[2] === 'lang') {
+      const selectedLang = interaction.fields.getStringSelectValues('language')[0] || 'english';
+      const existing = await db.query.guildConfigs.findFirst({
+        where: eq(guildConfigs.guildId, interaction.guildId)
+      });
+
+      if (existing) {
+        await db.update(guildConfigs).set({ language: selectedLang }).where(eq(guildConfigs.guildId, interaction.guildId));
+      } else {
+        await db.insert(guildConfigs).values({ guildId: interaction.guildId, language: selectedLang });
+      }
+
+      const newT = getTranslation(selectedLang);
+      const payload = await buildConfigPayload(interaction.guildId, newT);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
+      return;
+    }
+
+    // 5.1 Aventuras (/adventures)
+    if (parts[1] === 'advcreate') {
+      const page = parseInt(parts[2], 10);
+      const name = interaction.fields.getTextInputValue('name').trim();
+      const description = interaction.fields.getTextInputValue('description');
+      const isActive = interaction.fields.getCheckbox('is_active');
+
+      if (isActive) {
+        await db.update(adventures).set({ isActive: false }).where(eq(adventures.guildId, interaction.guildId));
+      }
+
+      await db.insert(adventures).values({
+        guildId: interaction.guildId,
+        name,
+        description,
+        isActive
+      });
+
+      const payload = await buildAdventuresPagePayload(interaction.guildId, 0, t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
+      return;
+    }
+
+    if (parts[1] === 'advedit') {
+      const advId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+      const name = interaction.fields.getTextInputValue('name').trim();
+      const description = interaction.fields.getTextInputValue('description');
+      const isActive = interaction.fields.getCheckbox('is_active');
+
+      if (isActive) {
+        await db.update(adventures).set({ isActive: false }).where(eq(adventures.guildId, interaction.guildId));
+      }
+
+      await db.update(adventures).set({ name, description, isActive }).where(eq(adventures.id, advId));
+      const payload = await buildAdventuresPagePayload(interaction.guildId, page, t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
+      return;
+    }
+
+    if (parts[1] === 'advdel') {
+      const advId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+      const confirmed = interaction.fields.getCheckbox('confirm_check');
+      if (confirmed) {
+        await db.delete(adventures).where(eq(adventures.id, advId));
+      }
+      const payload = await buildAdventuresPagePayload(interaction.guildId, Math.max(0, page - 1), t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
+      return;
+    }
+
+    // 5.2 Personajes (/characters)
+    if (parts[1] === 'charcreate') {
+      const advId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+      const name = interaction.fields.getTextInputValue('name').trim();
+      const rawTags = interaction.fields.getTextInputValue('tags');
+      const normalizedTags = parseTags(rawTags).join(' ');
+
+      if (name) {
+        await db.insert(characters).values({
+          guildId: interaction.guildId,
+          adventureId: advId,
+          name,
+          tags: normalizedTags
+        });
+      }
+
+      const payload = await buildCharactersListPayload(interaction.guildId, advId, page, t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
+      return;
+    }
+
+    if (parts[1] === 'chardel') {
+      const charId = parseInt(parts[2], 10);
+      const advId = parseInt(parts[3], 10);
+      const page = parseInt(parts[4], 10);
+      const confirmed = interaction.fields.getCheckbox('confirm_check');
+
+      if (confirmed) {
+        await db.delete(characters).where(eq(characters.id, charId));
+      }
+
+      const payload = await buildCharactersListPayload(interaction.guildId, advId, page, t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
+      return;
+    }
+
+    // 5.3 Edición de Ficha (/sheet)
     if (parts[1] === 'sh') {
       const fieldType = parts[2];
       const charId = parseInt(parts[3], 10);
@@ -1666,6 +2455,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } else if (fieldType === 'refresh') {
         const val = parseInt(interaction.fields.getTextInputValue('value'), 10);
         if (!isNaN(val)) await db.update(characters).set({ refresh: val }).where(eq(characters.id, charId));
+      } else if (fieldType === 'tags') {
+        const rawTags = interaction.fields.getTextInputValue('value');
+        const normalizedTags = parseTags(rawTags).join(' ');
+        await db.update(characters).set({ tags: normalizedTags }).where(eq(characters.id, charId));
       } else if (fieldType === 'desc') {
         const val = interaction.fields.getTextInputValue('value');
         await db.update(characters).set({ description: val }).where(eq(characters.id, charId));
@@ -1706,7 +2499,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const sheetRef = activeSheetInteractions.get(`${interaction.user.id}_${charId}`);
 
       if (updatedChar && sheetRef) {
-        const payload = buildSheetPagePayload(updatedChar, page, t);
+        const payload = await buildSheetPagePayload(updatedChar, interaction.user.id, page, t);
         await interaction.deferUpdate();
         await sheetRef.interaction.editReply(payload);
       } else {
@@ -1715,24 +2508,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // 5.2 Edición de Aventura (/adventure-info)
-    if (parts[1] === 'adv') {
-      const advId = parseInt(parts[2], 10);
-      const name = interaction.fields.getTextInputValue('name');
-      const description = interaction.fields.getTextInputValue('description');
-      const isActive = interaction.fields.getCheckbox('is_active');
+    // 5.4 Modales de Lista de Encuentros (/encounters)
+    if (parts[1] === 'enccreate') {
+      const page = parseInt(parts[2], 10);
+      const name = interaction.fields.getTextInputValue('name').trim();
+      const activeAdv = await getActiveAdventure(interaction.guildId);
 
-      // Si se marca como activa, desactivar cualquier otra aventura activa del servidor
-      if (isActive) {
-        await db.update(adventures).set({ isActive: false }).where(eq(adventures.guildId, interaction.guildId));
+      if (name) {
+        await db.insert(encounters).values({
+          guildId: interaction.guildId,
+          adventureId: activeAdv?.id || null,
+          name,
+          turnQueue: []
+        });
       }
 
-      await db.update(adventures).set({ name, description, isActive }).where(eq(adventures.id, advId));
-      await interaction.reply({ content: '✅ Adventure updated.', ephemeral: true });
+      const payload = await buildEncountersListPayload(interaction.guildId, page, t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
       return;
     }
 
-    // 5.3 Modales de Encuentro
+    if (parts[1] === 'encdel') {
+      const encounterId = parseInt(parts[2], 10);
+      const page = parseInt(parts[3], 10);
+      const confirmed = interaction.fields.getCheckbox('confirm_check');
+      if (confirmed) {
+        await db.delete(encounters).where(eq(encounters.id, encounterId));
+      }
+
+      const payload = await buildEncountersListPayload(interaction.guildId, page, t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
+      return;
+    }
+
+    // 5.5 Modales de Encuentro Específico
     if (parts[1] === 'enc') {
       const subAction = parts[2];
 
@@ -1763,7 +2574,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           const newCharName = interaction.fields.getTextInputValue('new_char_name').trim();
           let charIdToAdd: number | null = null;
 
-          // Prioridad: si eligió existente del select, usamos ese; si no, creamos/buscamos el nuevo por nombre
           if (selectedExistingIds.length > 0) {
             charIdToAdd = parseInt(selectedExistingIds[0], 10);
           } else if (newCharName) {
@@ -1808,7 +2618,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // 5.4 Modales de Notas
+    // 5.6 Modales de Notas (/notes)
+    if (parts[1] === 'notesearch') {
+      const vis = parts[2];
+      const query = interaction.fields.getTextInputValue('query').trim();
+      const key = `${interaction.guildId}_${interaction.user.id}`;
+      if (query) {
+        notesSearchState.set(key, query);
+      } else {
+        notesSearchState.delete(key);
+      }
+      const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, 0, t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
+      return;
+    }
+
+    if (parts[1] === 'notedel') {
+      const noteId = parseInt(parts[2], 10);
+      const vis = parts[3];
+      const page = parseInt(parts[4], 10);
+      const confirmed = interaction.fields.getCheckbox('confirm_check');
+      if (confirmed) {
+        await db.delete(notes).where(eq(notes.id, noteId));
+      }
+      const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, page, t);
+      await interaction.deferUpdate();
+      await interaction.editReply(payload);
+      return;
+    }
+
     if (parts[1] === 'note') {
       if (parts[2] === 'create') {
         const vis = parts[3];
@@ -1818,13 +2657,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const content = interaction.fields.getTextInputValue('content');
         const isPublic = (visValues[0] || 'public') === 'public';
 
-        const activeAdventure = await db.query.adventures.findFirst({
-          where: and(eq(adventures.isActive, true), eq(adventures.guildId, interaction.guildId))
-        });
+        const activeAdv = await getActiveAdventure(interaction.guildId);
 
         await db.insert(notes).values({
           guildId: interaction.guildId,
-          adventureId: activeAdventure?.id || null,
+          adventureId: activeAdv?.id || null,
           authorId: interaction.user.id,
           title: title || 'Untitled',
           content,
@@ -1841,9 +2678,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const vis = parts[3];
       const page = parseInt(parts[4], 10);
       const title = interaction.fields.getTextInputValue('title').trim();
+      const visValues = interaction.fields.getStringSelectValues('visibility');
       const content = interaction.fields.getTextInputValue('content');
+      const isPublic = (visValues[0] || 'public') === 'public';
 
-      await db.update(notes).set({ title: title || 'Untitled', content }).where(eq(notes.id, noteId));
+      await db.update(notes).set({ title: title || 'Untitled', content, isPublic }).where(eq(notes.id, noteId));
       const payload = await buildNotesListPayload(interaction.guildId, interaction.user.id, vis, page, t);
       await interaction.deferUpdate();
       await interaction.editReply(payload);
